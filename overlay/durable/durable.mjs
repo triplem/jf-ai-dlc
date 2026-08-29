@@ -26,13 +26,16 @@ const STATUS_FOR_ACTION = {
   START: 'STARTED',
   SUCCEED: 'SUCCEEDED',
   FAIL: 'FAILED',
-  RETRY: 'STARTED',
+  // A retry-scheduled step is PENDING: on the next invocation the SDK re-runs a
+  // PENDING step (a STARTED one is treated as already in-flight and skipped).
+  RETRY: 'PENDING',
 };
 
 let pool;
 let lambdaRoot;
 const handlerCache = new Map();
 const runLocks = new Map(); // arn → Promise (serialize invokes per execution)
+const scheduledWakes = new Set(); // arns with a pending timed re-invoke
 
 export async function initDurable(pgPool, lambdaRootDir) {
   pool = pgPool;
@@ -149,8 +152,9 @@ const invokeOnce = async (arn, updatedOperationIds) => {
   if (!exec || !['RUNNING', 'PENDING'].includes(exec.status)) return;
   const handler = await loadDurableHandler(exec.function_name);
   const ops = await getOps(arn);
+  // Faithful durable envelope: business input rides in the root EXECUTION op
+  // inside InitialExecutionState.Operations, not at the top level.
   const event = {
-    ...exec.input,
     DurableExecutionArn: arn,
     CheckpointToken: exec.checkpoint_token,
     InitialExecutionState: { Operations: ops, NextMarker: '' },
@@ -166,7 +170,10 @@ const invokeOnce = async (arn, updatedOperationIds) => {
     );
     return;
   }
-  const status = body?.Status || 'SUCCEEDED';
+  const status = body?.Status;
+  if (process.env.DURABLE_VERBOSE_MODE === 'true') {
+    console.log(`🟣 durable invoke returned Status=${status} keys=[${Object.keys(body || {}).join(',')}]`);
+  }
   if (status === 'SUCCEEDED') {
     await pool.query(`UPDATE durable_executions SET status='SUCCEEDED', output=$2, ended_at=now() WHERE arn=$1`, [
       arn,
@@ -178,12 +185,45 @@ const invokeOnce = async (arn, updatedOperationIds) => {
       body?.Error ?? null,
     ]);
   } else {
-    // PENDING: suspended on a callback/wait — leave RUNNING; a succeed re-invokes.
+    // PENDING (or any non-terminal): suspended. Either on an external callback
+    // (an SDK `succeed` re-invokes) or on a timer — a retrying step or a
+    // wait/park. For timers the runtime must re-invoke itself after the delay.
     await pool.query(`UPDATE durable_executions SET status='RUNNING' WHERE arn=$1`, [arn]);
+    await scheduleTimedWake(arn);
   }
 };
 
+// Re-invoke after the soonest pending timer (retry backoff or wait duration).
+// External-callback waits carry no timer and are resumed by `succeed` instead.
+const scheduleTimedWake = async (arn) => {
+  if (scheduledWakes.has(arn)) return;
+  const ops = await getOps(arn);
+  const delays = [];
+  for (const op of ops) {
+    // Retry-scheduled step: PENDING drives the re-run; the timer just re-invokes.
+    if (op.Type === 'STEP' && op.Action === 'RETRY' && op.Status === 'PENDING') {
+      delays.push(op.StepOptions?.NextAttemptDelaySeconds ?? 1);
+    }
+    if (op.Type === 'WAIT' && ['STARTED', 'PENDING'].includes(op.Status)) {
+      const secs =
+        op.WaitOptions?.DurationSeconds ??
+        (op.WaitOptions?.WakeTime ? (new Date(op.WaitOptions.WakeTime) - Date.now()) / 1000 : null);
+      if (secs != null) delays.push(Math.max(0, secs));
+    }
+  }
+  if (!delays.length) return;
+  const delayMs = Math.min(Math.min(...delays), 30) * 1000; // cap at 30s
+  scheduledWakes.add(arn);
+  setTimeout(() => {
+    scheduledWakes.delete(arn);
+    runInvoke(arn, []);
+  }, delayMs).unref?.();
+};
+
 // Start a durable execution for a normal Invoke of a durability-enabled function.
+// The business payload is delivered to the handler via a root EXECUTION
+// operation's ExecutionDetails.InputPayload (the SDK reads the FIRST operation
+// in step data as the customer event — NOT a flat merge onto the event).
 export const startDurableExecution = async (functionName, input) => {
   const arn = newArn(functionName);
   const token = crypto.randomUUID();
@@ -191,6 +231,17 @@ export const startDurableExecution = async (functionName, input) => {
     'INSERT INTO durable_executions (arn, function_name, input, checkpoint_token) VALUES ($1, $2, $3, $4)',
     [arn, functionName, input, token],
   );
+  const rootOp = {
+    Id: 'EXECUTION#root',
+    Type: 'EXECUTION',
+    Status: 'STARTED',
+    ExecutionDetails: { InputPayload: JSON.stringify(input) },
+  };
+  await pool.query('INSERT INTO durable_operations (arn, op_id, op) VALUES ($1, $2, $3)', [
+    arn,
+    rootOp.Id,
+    rootOp,
+  ]);
   runInvoke(arn, []); // fire-and-forget; the loop suspends on the first callback
   return arn;
 };
