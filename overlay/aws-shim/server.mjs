@@ -25,10 +25,17 @@ import { readdirSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import pg from 'pg';
+import {
+  initDurable,
+  handleDurableRest,
+  isDurableFunction,
+  startDurableExecution,
+} from '../durable/durable.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const lambdaRoot = path.resolve(process.env.LAMBDA_ROOT || path.join(here, '../../upstream/collab/lambda'));
 const pool = new pg.Pool({ connectionString: process.env.SHIM_PG_URL });
+await initDurable(pool, lambdaRoot);
 
 await pool.query(`CREATE TABLE IF NOT EXISTS aws_params (
   name TEXT PRIMARY KEY, value TEXT NOT NULL, type TEXT NOT NULL DEFAULT 'String', version INT NOT NULL DEFAULT 1)`);
@@ -239,9 +246,27 @@ const server = http.createServer(async (req, res) => {
     }
     const raw = await readBody(req);
 
+    // Durable Execution runtime + control plane (REST-JSON under /2025-12-01/).
+    const durable = await handleDurableRest(req.method, req.url, raw);
+    if (durable) {
+      res.writeHead(durable.status, { 'content-type': 'application/json' });
+      res.end(JSON.stringify(durable.body));
+      return;
+    }
+
     const invokeMatch = req.url.match(/^\/2015-03-31\/functions\/([^/]+)\/invocations/);
     if (invokeMatch) {
-      const result = await invokeLambda(decodeURIComponent(invokeMatch[1]), raw ? JSON.parse(raw) : {});
+      const fn = decodeURIComponent(invokeMatch[1]);
+      const payload = raw ? JSON.parse(raw) : {};
+      // A durability-enabled function's Invoke STARTS a durable execution
+      // (there is no StartDurableExecution command) and returns its ARN.
+      if (isDurableFunction(fn)) {
+        const arn = await startDurableExecution(fn, payload);
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ DurableExecutionArn: arn, StatusCode: 202 }));
+        return;
+      }
+      const result = await invokeLambda(fn, payload);
       res.writeHead(result.status, { 'content-type': 'application/json', ...(result.headers || {}) });
       res.end(JSON.stringify(result.body));
       return;
