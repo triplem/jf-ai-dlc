@@ -37,20 +37,28 @@ const compiled = routes.map((r) => ({
 
 const matchRoute = (method, pathname) => {
   const parts = pathname.split('/').filter(Boolean);
+  let best = null; // most-specific match wins (literal segments beat params),
+  let bestScore = -1; // e.g. GET /intents/metrics must beat /intents/{intentId}
   outer: for (const route of compiled) {
     if (route.method !== method && !(method === 'OPTIONS' && route.type === 'mock')) continue;
     if (route.segments.length !== parts.length) continue;
     const pathParameters = {};
+    let literals = 0;
     for (let i = 0; i < parts.length; i += 1) {
       const seg = route.segments[i];
       if (seg.literal !== undefined) {
         if (seg.literal !== parts[i]) continue outer;
+        literals += 1;
       } else {
         pathParameters[seg.param] = decodeURIComponent(parts[i]);
       }
     }
-    return { route, pathParameters };
+    if (literals > bestScore) {
+      best = { route, pathParameters };
+      bestScore = literals;
+    }
   }
+  if (best) return best;
   // OPTIONS preflight for any known path (upstream fronted everything with CORS modules)
   if (method === 'OPTIONS') return { route: { type: 'mock', auth: false }, pathParameters: {} };
   return null;

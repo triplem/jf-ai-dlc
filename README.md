@@ -210,6 +210,10 @@ Everything that differs from upstream, in one place:
 - **Issuer split**: tokens carry the public issuer (`OIDC_ISSUER`) while JWKS
   are fetched in-network (`OIDC_JWKS_URL`); Keycloak is pinned via
   `KC_HOSTNAME` so `iss` is stable.
+- **api-router route precedence**: a literal path segment beats a parameter at
+  the same depth (so `GET /intents/metrics` resolves to the metrics rollup, not
+  `/intents/{intentId}` with `intentId="metrics"`). The matcher scores matches
+  by literal-segment count and picks the most specific.
 - **Config env vars the deploy must set** (found via the click-test):
   `AWS_ENDPOINT_URL_COGNITO_IDENTITY_PROVIDER` (the SDK's service key uses the
   full `COGNITO_IDENTITY_PROVIDER` id, not `COGNITO_IDP`, or the admin lambda
@@ -249,11 +253,12 @@ Everything that differs from upstream, in one place:
   → `Bearer` API call returns 200.
 - **Browser click-test** (headless Chromium against the live stack): 8/8 deep
   flows green with zero console errors and zero API errors — login, dashboard,
-  open space, new-intent page, block library, workflows, create-space wizard,
-  and Platform Admin (which lists the Keycloak realm users via aws-shim:
-  "2 users · 1 admin"). Realtime transport verified separately: ws-gateway
-  closes an unauthenticated socket `4401`, and a valid-JWT socket reaches the
-  upstream `$connect` handler (`4403` until a per-intent doc token is supplied).
+  open space (detail renders with the `owner` badge and metrics rollup),
+  new-intent page, block library, workflows, create-space wizard, and Platform
+  Admin (which lists the Keycloak realm users via aws-shim: "2 users · 1
+  admin"). Realtime transport verified separately: ws-gateway closes an
+  unauthenticated socket `4401`, and a valid-JWT socket reaches the upstream
+  `$connect` handler (`4403` until a per-intent doc token is supplied).
 - Helm: `helm lint` clean, `helm template` renders 16 resources.
 
 ## Known gaps
