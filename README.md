@@ -4,6 +4,10 @@ An open-source, self-hosted port of the **AI-DLC v2** methodology and the
 **Collaborative AI-DLC** platform. All AWS services are replaced with OSS
 components: Docker Compose for testing, Kubernetes (Helm) for production.
 
+This project **stands on the shoulders of giants**: the methodology and platform
+are the work of AWS Labs and AWS Samples — jf-ai-dlc is a packaging/adapter
+layer, not a reimplementation. See [docs/why.md](docs/why.md) for full credit.
+
 Built from two regularly-updated upstreams, vendored via `git subtree`
 (pinned refs in [UPSTREAM_VERSIONS.md](UPSTREAM_VERSIONS.md)):
 
@@ -75,7 +79,18 @@ overlay/             all local code
 plugins/             vendored aidlc dists for Claude Code + Codex (transformed)
 deploy/compose/      full test stack        deploy/helm/jf-ai-dlc/  prod chart
 scripts/             generators + installers + update workflow
+docs/                topical documentation (see below)
 ```
+
+## Documentation
+
+Deeper, topical docs live in [`docs/`](docs/) (this README stays the high-level
+overview):
+
+- [Why this project exists](docs/why.md) — the problem it solves and full credit to the upstream projects.
+- [Requirements & dependencies](docs/requirements.md) — host tooling and runtime services, with versions, homepages, and licenses.
+- [Updating the upstreams](docs/upstream-updates.md) — how to fetch a newer AI-DLC / Collaborative AI-DLC version.
+- [Docker images & Compose](docs/docker.md) — every image and a service-by-service tour of the Compose stack.
 
 ## Scripts
 
