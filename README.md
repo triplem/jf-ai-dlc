@@ -45,6 +45,7 @@ Built from two regularly-updated upstreams, vendored via `git subtree`
 | Neptune (Gremlin) | Gremlin Server (compose) / JanusGraph (k8s) | env: `NEPTUNE_ENDPOINT`, `GREMLIN_PORT`, `GREMLIN_PROTOCOL` |
 | S3 | SeaweedFS | `AWS_ENDPOINT_URL_S3` + a `<bucket>.seaweedfs` network alias for virtual-host addressing |
 | Cognito (authorizer) | Keycloak + `overlay/api-router` | router verifies OIDC tokens (JWKS) and projects claims onto the Cognito names handlers read (`sub`, `email`, `cognito:username`, `cognito:groups`, `custom:display_name`) |
+| Cognito (frontend SPA auth) | Keycloak + `overlay/frontend/auth.ts` | drop-in replacement for the Amplify auth module (password grant + Auth-Code/PKCE), swapped in at Vite build time — upstream frontend source unchanged |
 | Cognito (admin API) | Keycloak Admin API via `overlay/aws-shim` | ListUsers / ListUsersInGroup / AdminGetUser / AdminAdd(Remove)UserToGroup mapped onto realm users + groups |
 | API Gateway (HTTP) | `overlay/api-router` | route table generated from the upstream terraform by `scripts/gen-routes.mjs` (164 routes / 23 lambdas); handlers run in-process |
 | API Gateway (WebSocket) | `overlay/ws-gateway` | drives `ws-connection` / `ws-message` in-process + serves the `@connections` management API `ws-fanout` targets |
@@ -54,7 +55,7 @@ Built from two regularly-updated upstreams, vendored via `git subtree`
 | Bedrock AgentCore | `overlay/session-runner` | serves the `InvokeAgentRuntime` wire protocol; backends: shared runtime (`http`) or docker container-per-session; the upstream agentcore image runs unmodified |
 | Bedrock inference | direct Anthropic / OpenAI API keys | env/secrets into the agentcore container. **LiteLLM later**: point the CLI base-URL envs at a LiteLLM deployment — no code change |
 | Pricing API | stub in `overlay/aws-shim` | returns an empty price list; cost estimates degrade gracefully |
-| CloudFront + S3 hosting | static frontend container behind ingress | *frontend not yet wired — see Known gaps* |
+| CloudFront + S3 hosting | nginx static container (`overlay/frontend/Dockerfile`) | built SPA served with history fallback; behind the ingress in k8s |
 | Secrets Manager (deploy-time) | compose env / k8s Secrets | `existingSecret` in the Helm chart |
 
 ## Repository layout
@@ -69,6 +70,7 @@ overlay/             all local code
   session-runner/    AgentCore control-plane replacement
   bootstrap/         table/bucket creation (+ generated tables.json)
   oracle/            runs the upstream vitest suite against dynamo-pg
+  frontend/          Keycloak/OIDC auth swap + Vite override + SPA Dockerfile
   patches/           in-tree diffs (currently none)
 plugins/             vendored aidlc dists for Claude Code + Codex (transformed)
 deploy/compose/      full test stack        deploy/helm/jf-ai-dlc/  prod chart
@@ -143,8 +145,11 @@ TOKEN=$(curl -s http://localhost:8081/realms/jf-ai-dlc/protocol/openid-connect/t
 curl -H "Authorization: Bearer $TOKEN" http://localhost:3001/api/projects
 ```
 
-Endpoints: API `:3001` · WebSocket `:3002` · Keycloak `:8081` (admin/admin) ·
-dynamo-pg `:8000` · Gremlin `:8182` · S3 `:8333` · yjs `:1234`.
+Open the web UI at **http://localhost:8088** and sign in with `alice` /
+`password` (a regular user) or `admin` / `admin` (platform admin).
+
+Endpoints: **Web UI `:8088`** · API `:3001` · WebSocket `:3002` · Keycloak
+`:8081` (admin/admin) · dynamo-pg `:8000` · Gremlin `:8182` · S3 `:8333` · yjs `:1234`.
 
 **Deploy to Kubernetes**
 
@@ -187,6 +192,18 @@ Everything that differs from upstream, in one place:
   consumed by `install-plugin.sh`.
 
 ### Behavioral adjustments (no upstream code modified)
+- **Frontend auth module swapped**: `overlay/frontend/auth.ts` is a drop-in
+  replacement for `frontend/src/services/auth.ts` (Amplify/Cognito → Keycloak
+  OIDC, dependency-free — password grant for the login form, Auth-Code + PKCE
+  for SSO). The swap is a Vite `resolveId` redirect in
+  `overlay/frontend/vite.config.jf.ts` (matches by resolved absolute path, so
+  every importer is caught), so upstream source is untouched and Amplify is
+  fully absent from the bundle. It keeps the exact export surface, so consumers
+  still type-check against the original module. Profile edits (display name /
+  avatar) are held in a browser-local overlay since the SPA has no Keycloak
+  write grant. `jf-ui` client `webOrigins: ["*"]` enables the browser's
+  cross-origin token request; the frontend build skips `tsc -b` (the swap is a
+  Vite-time concern) and serves via nginx with SPA history fallback.
 - **ws-authorizer is bypassed**: it is Cognito-specific (`aws-jwt-verify`);
   `ws-gateway` verifies Keycloak tokens itself and synthesizes the same
   `authorizer: { userId, userName }` context.
@@ -215,13 +232,19 @@ Everything that differs from upstream, in one place:
 - Compose e2e smoke: Keycloak login → `POST /api/projects` 201 →
   `GET /api/projects` returns the project with `userRole: owner`
   (DynamoDB + graph writes both exercised).
+- Frontend: builds with zero Amplify residue in the bundle; served SPA returns
+  200 with history fallback; full browser-equivalent flow verified — Keycloak
+  password grant (with CORS) → `id_token` (carries `groups` for platform-admin)
+  → `Bearer` API call returns 200.
 - Helm: `helm lint` clean, `helm template` renders 16 resources.
 
 ## Known gaps
 
-- **Frontend**: `upstream/collab/frontend` authenticates with `aws-amplify`
-  (Cognito-only). The OIDC (Keycloak) shim patch is the next planned change;
-  until then the platform is API-complete but has no web UI in the stack.
+- **Frontend deep flows** beyond auth (realtime editing, intent orchestration
+  UI) are wired but not yet click-tested end-to-end against the live stack;
+  auth, routing, and API calls are verified.
+- **Frontend profile edits** are stored browser-local (the SPA has no Keycloak
+  account-write grant); they don't propagate to Keycloak user attributes.
 - **session-runner k8s backend**: prod currently uses the shared-runtime
   (`http`) backend against an agentcore Deployment; a Jobs-per-session backend
   is planned.
