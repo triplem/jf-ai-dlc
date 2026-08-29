@@ -1,0 +1,15 @@
+# Local-only Claude Code observability tooling — not part of this project
+claude-otel.sh
+docker-compose.claude-otel.yml
+config/claude-otel/
+
+# Node
+node_modules/
+
+# Environment files
+.env
+.env.local
+*.local.env
+
+# Editor / OS
+.DS_Store
