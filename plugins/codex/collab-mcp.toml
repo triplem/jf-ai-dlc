@@ -1,0 +1,6 @@
+# >>> jf-ai-dlc collab >>>
+# Collab platform MCP entry — appended to .codex/config.toml by
+# install-plugin.sh --with-collab, removed by --no-collab (via these markers).
+[mcp_servers.collaborative-aidlc]
+url = "http://localhost:8080/mcp"
+# <<< jf-ai-dlc collab <<<
