@@ -236,6 +236,9 @@ services:
       <<: *app-env
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      # Remap the default Bedrock tier IDs to direct Anthropic model IDs. All
+      # tiers → Sonnet for a cheap first run (override per your cost/quality).
+      AIDLC_MODEL_ALIASES: '{"opus":"claude-sonnet-4-6","sonnet":"claude-sonnet-4-6","haiku":"claude-sonnet-4-6"}'
 
 networks:
   default:

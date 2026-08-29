@@ -249,7 +249,21 @@ Everything that differs from upstream, in one place:
   routing per connection is added.
 
 ### In-tree patches (`overlay/patches/`)
-- none currently.
+- `0001-agentcore-claude-direct-anthropic.patch` — the agentcore Claude driver
+  (`cli/drivers.js` `envForAuth`) hardcodes `CLAUDE_CODE_USE_BEDROCK=1`; the
+  patch makes it use `ANTHROPIC_API_KEY` directly (native Anthropic API, no
+  Bedrock) when a direct key is present and no Bedrock token is. Paired with
+  `AIDLC_MODEL_ALIASES` on the compose `agentcore` service (Bedrock tier IDs →
+  direct Anthropic model IDs). Re-applied by `scripts/update-upstream.sh`.
+
+### Durable execution runtime (`overlay/durable/`)
+- The `v2-orchestrator` runs on AWS Lambda Durable Execution
+  (`@aws/durable-execution-sdk-js`), which has no OSS equivalent.
+  `overlay/durable/` is a from-scratch emulator (protocol in
+  `overlay/durable/PROTOCOL.md`) mounted in `aws-shim`: a Postgres-backed
+  operation log + the REST runtime/control planes + a driver that runs the
+  orchestrator's invoke/replay/retry/callback loop off-Lambda. This is what
+  makes starting an intent drive stages.
 
 ## Verification status
 
