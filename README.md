@@ -75,6 +75,23 @@ deploy/compose/      full test stack        deploy/helm/jf-ai-dlc/  prod chart
 scripts/             generators + installers + update workflow
 ```
 
+## Scripts
+
+All scripts are safe to re-run (idempotent) and live in `scripts/` unless noted.
+
+| Script | What it does |
+|---|---|
+| `build-plugin.sh [claude\|codex\|both] [--check] [--from-dist]` | **Fully automatic core→plugin build.** Per harness: runs upstream's packager (`bun scripts/package.ts`, core→dist) then the OSS transforms (dist→plugin). `--check` adds the drift guard; `--from-dist` skips the rebuild (no `bun` needed). Handles the one-time `bun install`. |
+| `vendor-plugins.mjs [claude\|codex]` | The dist→plugin transform step alone (strip AWS MCP servers; Codex→native OpenAI auth; write collab toggle templates). Called by `build-plugin.sh` and `update-upstream.sh`; run directly to re-apply transforms without rebuilding from core. |
+| `install-plugin.sh <target-dir> claude\|codex\|both [--with-collab\|--no-collab]` | Installs a built plugin into a consuming project. Key-merges `.mcp.json`, appends `.gitignore`, and toggles the collab platform MCP entry. |
+| `gen-routes.mjs` | Parses the upstream terraform API module into `overlay/api-router/routes.json` (164 routes / 23 lambdas). Re-run after every upstream update. |
+| `gen-tables.mjs` | Parses every `aws_dynamodb_table` in the upstream terraform into `overlay/bootstrap/tables.json` (14 tables + GSIs). Re-run after every upstream update. |
+| `update-upstream.sh [--aidlc <ref>] [--collab <ref>]` | Pulls the subtrees, re-applies `overlay/patches/`, regenerates routes/tables/plugins, runs the adapter tests, and refreshes `UPSTREAM_VERSIONS.md`. |
+| `overlay/bootstrap/bootstrap.mjs` | One-shot stack bootstrap — creates the DynamoDB tables (from `tables.json`) and S3 buckets. Run as the `bootstrap` compose service or the Helm bootstrap Job. |
+
+`build-plugin.sh` requires `bun` for the core→dist rebuild
+(`curl -fsSL https://bun.sh/install | bash`); everything else runs on `node`.
+
 ## Usage
 
 **Build the plugins from core (core → Claude / Codex plugin)**
