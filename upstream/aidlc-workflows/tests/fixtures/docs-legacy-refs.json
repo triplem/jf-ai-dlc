@@ -1,0 +1,81 @@
+{
+  "_comment": "Docs legacy-ref allowlist gate (t174). The gate scans docs/**/*.md + core/templates/*.md + each harness/<h>/skills/aidlc/SKILL.md (derived FROM DISK) and FAILS unless every surviving retired-token line is pinned here by exact file + line text, with the pinned count <= ceiling. FOUR retired-token lanes: (1) `aidlc-docs` \u2014 the flat record layout relocated to aidlc/spaces/<space>/intents/<slug>-<id8>/; (2) bare `--init` \u2014 the retired aidlc command; (3) dotted rules dirs `.claude/rules/` | `.kiro/steering/` | `.codex/aidlc-rules/` \u2014 the method/rules layer relocated to aidlc/spaces/<space>/memory/ (graph.ts MEMORY_SEGMENTS), so these survive ONLY in native-include prose (the `.claude/rules/aidlc.md` @-import stub, Kiro IDE's `.kiro/steering/aidlc-active-memory.md`, the packager rename narrative); (4) `*-learnings.md` filename \u2014 learnings collapsed into practices in memory/{team,project}.md (aidlc-learnings.ts), so there are ZERO legitimate survivors. EXCLUDES dist/** (generated; package.ts --check proves parity) and core/aidlc-common/** (the engine-parsed stage tree's aidlc-docs reroot is a separate deferred sweep). Adding an entry requires a visible diff here; blanket-allowlisting trips the ceiling. See docs/reference/07-sensor-system.md, docs/reference/14-claude-features.md, docs/harness-engineering/06-sensors.md.",
+  "ceiling": 15,
+  "allowed": [
+    {
+      "file": "docs/reference/14-claude-features.md",
+      "text": "| **Standing rules** (the layer chain) | `aidlc/spaces/<active-space>/memory/` (via `.claude/rules/aidlc.md` @-import stub) | `aidlc/spaces/<active-space>/memory/` (via agent resources) | `aidlc/spaces/<active-space>/memory/` (via always-included steering live references) | `aidlc/spaces/<active-space>/memory/` (via `AIDLC_RULES_DIR`) | `aidlc/spaces/<active-space>/memory/` (via `instructions` glob) | `aidlc/spaces/<active-space>/memory/` (via `AGENTS.md` @-imports) | `aidlc/spaces/<active-space>/memory/` (always-applied `rules/aidlc.mdc` standing pointer + four agent-decided phase pointers) |",
+      "why": "native-include mapping: names the .claude/rules/aidlc.md @-import stub that pulls the relocated memory tree (correct, not stale)"
+    },
+    {
+      "file": "docs/reference/14-claude-features.md",
+      "text": "This implementation reads behavioral rules from the active space memory layer at `aidlc/spaces/<active-space>/memory/`, pulled into Claude's context via the `.claude/rules/aidlc.md` @-import stub. One file per layer of the inheritance chain:",
+      "why": "names the .claude/rules/aidlc.md @-import stub (the native include, correct)"
+    },
+    {
+      "file": "docs/reference/14-claude-features.md",
+      "text": "**Why the org/team files stay lean:** Claude Code loads the space memory files (via the `.claude/rules/aidlc.md` @-import stub) into each conversation, including non-AI-DLC ones. Keeping the shipped layers to concise, topical structure avoids polluting regular development sessions. Detailed methodology that the upstream specification places in rules instead lives in `.claude/knowledge/aidlc-shared/` or in SKILL.md and stage-protocol.md, loaded only when `/aidlc` is active.",
+      "why": "names the .claude/rules/aidlc.md @-import stub (the native include, correct)"
+    },
+    {
+      "file": "docs/reference/14-claude-features.md",
+      "text": "| Rules | `aidlc/spaces/<active-space>/memory/*.md` (via `.claude/rules/aidlc.md` @-stub) | Every conversation | Minimal guardrails; self-learning corrections |",
+      "why": "names the .claude/rules/aidlc.md @-import stub (the native include, correct)"
+    },
+    {
+      "file": "docs/reference/06-hooks-and-tools.md",
+      "text": "Claude and Codex consume `hookSpecificOutput.updatedInput`; the opencode adapter applies that rewrite to `output.args`. The hook serializes the complete response before writing and refuses an oversized response with repair guidance, so a transport ceiling cannot turn it into truncated JSON. Kiro CLI exposes subagent arguments but has no rewrite channel, so its adapter observes the proposed rewrite and emits an advisory warning while allowing dispatch; its agent-v1 `resources` preload the memory tree. A valid bundle that exceeds the rewrite limit also proceeds through that native preload, while a missing, unreadable, or invalid UTF-8 required rule still blocks with repair guidance. Kiro IDE does not register this hook because tool-argument delivery is not uniform across supported generations; `.kiro/steering/aidlc-active-memory.md` is always included and uses live file references to preload the active memory tree for the conductor and delegated agents.",
+      "why": "names Kiro IDE's native always-included steering file that loads the relocated active-space memory tree"
+    },
+    {
+      "file": "docs/guide/harnesses/kiro-ide.md",
+      "text": "- `.kiro/steering/aidlc-active-memory.md` \u2014 always-included IDE steering whose",
+      "why": "documents Kiro IDE's native always-included steering file"
+    },
+    {
+      "file": "docs/reference/01-architecture.md",
+      "text": "9. **Minimal rules** -- Only guardrails (~35 lines total) live in the active space memory layer (`aidlc/spaces/<active-space>/memory/`, pulled in via the `.claude/rules/aidlc.md` @-import stub). Everything else (verification, brownfield safeguards, audit format, adaptive patterns) lives in `knowledge/aidlc-shared/` or the static/conditional protocol files. This prevents context bloat in non-AI-DLC conversations since rules are always loaded.",
+      "why": "names the .claude/rules/aidlc.md @-import stub (the native include, correct)"
+    },
+    {
+      "file": "docs/harness-engineering/06-sensors.md",
+      "text": "`**/{aidlc-docs,intents}/**` — the per-intent record tree, with the legacy",
+      "why": "sensor matches-glob value (the shipped framework glob, post-P9)"
+    },
+    {
+      "file": "docs/harness-engineering/06-sensors.md",
+      "text": "`aidlc-docs/` arm kept for a pre-migration project), traceability scopes to",
+      "why": "prose explaining the legacy aidlc-docs arm of the sensor glob"
+    },
+    {
+      "file": "docs/reference/07-sensor-system.md",
+      "text": "matches: \"**/{aidlc-docs,intents}/**\"                  # optional capability filter",
+      "why": "sensor manifest frontmatter example (the shipped glob)"
+    },
+    {
+      "file": "docs/reference/07-sensor-system.md",
+      "text": "| `aidlc-required-sections.md` | `**/{aidlc-docs,intents}/**` |",
+      "why": "shipped required-sections sensor matches-glob value"
+    },
+    {
+      "file": "docs/reference/07-sensor-system.md",
+      "text": "| `aidlc-upstream-coverage.md` | `**/{aidlc-docs,intents}/**` |",
+      "why": "shipped upstream-coverage sensor matches-glob value"
+    },
+    {
+      "file": "docs/reference/07-sensor-system.md",
+      "text": "| `aidlc-claim-sources.md` | `**/{aidlc-docs,intents}/**` |",
+      "why": "shipped claim-sources sensor matches-glob value"
+    },
+    {
+      "file": "docs/guide/12-cli-commands.md",
+      "text": "| Submodules | If a `.gitmodules` is present, reports how many submodule paths are declared and how many are uninitialized, naming `git submodule update --init --recursive` when any are (advisory - never fails) |",
+      "why": "the `--init` is part of the canonical `git submodule update --init --recursive` remedy (the doctor Submodules row names it), NOT the retired aidlc `--init` command"
+    },
+    {
+      "file": "docs/reference/04-stages/initialization.md",
+      "text": "- A parseable `.gitmodules` with at least one submodule path entry is a brownfield signal (repo metadata declares code even when the submodule dirs are uninitialized). When submodule paths are uninitialized, the scan warns and names `git submodule update --init --recursive` - surfaced in the `WORKSPACE_SCANNED` event (`Submodules` field + `Details` remedy) and on creation stdout so the conductor can relay it; languages stay as scanned",
+      "why": "the `--init` is part of the canonical `git submodule update --init --recursive` remedy the workspace-detection scanner names, NOT the retired aidlc `--init` command"
+    }
+  ]
+}

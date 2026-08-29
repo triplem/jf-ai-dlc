@@ -1,0 +1,811 @@
+// t241-opencode-adapter: execute the authored plugin factory against synthetic
+// opencode lifecycle calls and real or purpose-built core hook subprocesses.
+//
+// covers: function:KNOWN_HARNESS_DIRS, hook:aidlc-rebuild-stage-graph
+
+import { afterEach, describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
+import {
+  appendFileSync,
+  cpSync,
+  copyFileSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { basename, dirname, join, relative } from "node:path";
+import createAdapter, {
+  type PluginInput,
+} from "../../harness/opencode/plugin/aidlc-opencode-adapter.ts";
+import {
+  createTestProject,
+  seedAidlcMemory,
+  seededAuditDir,
+  seededAuditShard,
+  seededRecordDir,
+  seedStateFile,
+} from "../harness/fixtures.ts";
+import {
+  inspectSubagentInflight,
+  subagentInflightMarkerPath,
+  writeSessionBinding,
+} from "../../dist/claude/.claude/tools/aidlc-lib.ts";
+import { writeActiveDirectiveMarker } from "../../core/tools/aidlc-lib.ts";
+
+const REPO_ROOT = join(import.meta.dir, "..", "..");
+const TEST_ENTRYPOINTS = new Set([
+  "tools/aidlc-state.ts",
+  "tools/aidlc-utility.ts",
+  "hooks/aidlc-continue-workflow.ts",
+]);
+const scratch: string[] = [];
+
+afterEach(() => {
+  for (const dir of scratch.splice(0)) {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+function freshProject(): string {
+  const root = mkdtempSync(join(tmpdir(), "t241-opencode-"));
+  scratch.push(root);
+  mkdirSync(join(root, ".aidlc", "hooks"), { recursive: true });
+  mkdirSync(join(root, ".aidlc", "tools"), { recursive: true });
+  return root;
+}
+
+function freshInstalledProject(): string {
+  const root = createTestProject();
+  scratch.push(root);
+  cpSync(
+    join(REPO_ROOT, "dist", "opencode", ".aidlc"),
+    join(root, ".aidlc"),
+    { recursive: true },
+  );
+  return root;
+}
+
+function seedUnapprovedCodeGeneration(root: string): void {
+  seedStateFile(root, "state-construction.md");
+  const statePath = join(seededRecordDir(root), "aidlc-state.md");
+  const state = readFileSync(statePath, "utf-8").replace(
+    /^- \*\*Current Stage\*\*:.*$/m,
+    "- **Current Stage**: code-generation",
+  );
+  writeFileSync(statePath, state);
+  writeActiveDirectiveMarker(root, {
+    kind: "run-stage",
+    stage: "code-generation",
+    state_sha256: createHash("sha256").update(state).digest("hex"),
+  });
+}
+
+function readAudit(root: string): string {
+  const auditDir = seededAuditDir(root);
+  return readdirSync(auditDir)
+    .filter((name) => name.endsWith(".md"))
+    .sort()
+    .map((name) => readFileSync(join(auditDir, name), "utf-8"))
+    .join("\n");
+}
+
+function appendInteractionEvent(
+  root: string,
+  event: "DECISION_RECORDED" | "QUESTION_ANSWERED" | "STAGE_STARTED",
+  stage: string,
+): void {
+  const shard = seededAuditShard(root);
+  mkdirSync(dirname(shard), { recursive: true });
+  appendFileSync(
+    shard,
+    `\n## ${event}\n` +
+      `**Timestamp**: ${new Date().toISOString()}\n` +
+      `**Event**: ${event}\n` +
+      `**Stage**: ${stage}\n\n---\n`,
+    "utf-8",
+  );
+}
+
+function writeHook(root: string, name: string, source: string): void {
+  const path = join(root, ".aidlc", "hooks", name);
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(path, source, "utf-8");
+}
+
+function copyCore(root: string, relativePath: string): void {
+  const source = join(REPO_ROOT, "core", relativePath);
+  const destination = join(root, ".aidlc", relativePath);
+  mkdirSync(dirname(destination), { recursive: true });
+  copyFileSync(source, destination);
+}
+
+function fakeClient(parentBySession: Record<string, string | undefined> = {}) {
+  const prompts: Array<{ id: string; text: string }> = [];
+  const client: PluginInput["client"] = {
+    session: {
+      get: async ({ path }) => ({
+        data: parentBySession[path.id]
+          ? { parentID: parentBySession[path.id] }
+          : {},
+      }),
+      prompt: async ({ path, body }) => {
+        prompts.push({ id: path.id, text: body.parts[0]?.text ?? "" });
+      },
+    },
+  };
+  return { client, prompts };
+}
+
+function postTool(tool: string, args: Record<string, unknown>) {
+  return {
+    tool,
+    sessionID: "main",
+    callID: `call-${tool}`,
+    args,
+  };
+}
+
+describe("t241 OpenCode adapter command boundary and transition filter", () => {
+  test("rejects compound AIDLC bun commands but leaves one invocation and unrelated bash alone", async () => {
+    const root = freshProject();
+    const { client } = fakeClient();
+    const adapter = await createAdapter({
+      client,
+      directory: root,
+      aidlcEntrypoints: TEST_ENTRYPOINTS,
+    });
+    const before = adapter["tool.execute.before"];
+    const invoke = (callID: string, command: string) =>
+      before(
+        { tool: "bash", sessionID: "main", callID },
+        { args: { command } },
+      );
+    await expect(
+      invoke("safe", "bun .aidlc/tools/aidlc-state.ts approve"),
+    ).resolves.toBeUndefined();
+    await expect(
+      invoke("quoted", 'bun .aidlc/tools/aidlc-utility.ts status "a && b"'),
+    ).resolves.toBeUndefined();
+    await expect(
+      invoke("unrelated", "echo ok && touch /tmp/example"),
+    ).resolves.toBeUndefined();
+    await expect(
+      invoke(
+        "compound",
+        "bun .aidlc/tools/aidlc-utility.ts status && touch /tmp/example",
+      ),
+    ).rejects.toThrow("one direct invocation");
+    await expect(
+      invoke("redirect", "bun .aidlc/hooks/aidlc-continue-workflow.ts > /tmp/example"),
+    ).rejects.toThrow("one direct invocation");
+    await expect(
+      invoke("unknown", "bun .aidlc/tools/payload.ts"),
+    ).rejects.toThrow("shipped tool or hook");
+    await expect(
+      invoke(
+        "quote-bypass",
+        "bun .aidlc/tools/aidlc-utility.ts status 'a\\' ; touch /tmp/x #'",
+      ),
+    ).rejects.toThrow("one direct invocation");
+  });
+
+  test("an OpenCode state transition passes the real runtime hook command gate", async () => {
+    const root = freshProject();
+    copyCore(root, "hooks/aidlc-rebuild-stage-graph.ts");
+    copyCore(root, "tools/aidlc-lib.ts");
+    copyCore(root, "tools/aidlc-artifact-vocabulary.ts");
+    copyCore(root, "tools/aidlc-runtime-paths.ts");
+    mkdirSync(join(root, "aidlc"), { recursive: true });
+    writeFileSync(join(root, "aidlc", ".aidlc-hook-debug"), "", "utf-8");
+
+    const { client } = fakeClient();
+    const adapter = await createAdapter({ client, directory: root });
+    await adapter["tool.execute.after"](
+      postTool("bash", {
+        command: "bun .aidlc/tools/aidlc-state.ts approve",
+      }),
+    );
+
+    const debug = readFileSync(
+      join(
+        root,
+        "aidlc",
+        "spaces",
+        "default",
+        "intents",
+        ".aidlc-hooks-health",
+        "hook-debug.log",
+      ),
+      "utf-8",
+    );
+    expect(debug).toContain("rebuild-stage-graph\texit: audit empty");
+    expect(debug).not.toContain("exit: command not a transition tool");
+  });
+
+  test("post-shell creation forwards the invoking session and result", async () => {
+    const root = freshProject();
+    const trace = join(root, "runtime-input.json");
+    writeHook(
+      root,
+      "aidlc-rebuild-stage-graph.ts",
+      `import { writeFileSync } from "node:fs";
+writeFileSync(${JSON.stringify(trace)}, await Bun.stdin.text(), "utf-8");
+`,
+    );
+    const { client } = fakeClient();
+    const adapter = await createAdapter({ client, directory: root });
+    await adapter["tool.execute.after"](
+      postTool("bash", {
+        command: "bun .aidlc/tools/aidlc-utility.ts intent-create --scope poc",
+      }),
+      {
+        output: "Intent created: fixture-record (space: default)\n",
+      },
+    );
+
+    const payload = JSON.parse(readFileSync(trace, "utf-8")) as {
+      session_id?: string;
+      tool_input?: { command?: string };
+      tool_response?: string;
+    };
+    expect(payload.session_id).toBe("main");
+    expect(payload.tool_input?.command).toContain("intent-create");
+    expect(payload.tool_response).toContain("Intent created: fixture-record");
+  });
+});
+
+describe("t241 OpenCode adapter reviewer scope", () => {
+  test("blocks a sibling-unit read and allows the dispatched unit", async () => {
+    const root = freshProject();
+    copyCore(root, "hooks/aidlc-reviewer-scope.ts");
+    copyCore(root, "tools/aidlc-audit.ts");
+    copyCore(root, "tools/aidlc-lib.ts");
+    copyCore(root, "tools/aidlc-artifact-vocabulary.ts");
+    copyCore(root, "tools/aidlc-runtime-paths.ts");
+
+    const recordRoot = join(root, "aidlc", "spaces", "default", "intents");
+    const current = join(recordRoot, "construction", "U01", "design.md");
+    const sibling = join(recordRoot, "construction", "U02", "design.md");
+    mkdirSync(dirname(current), { recursive: true });
+    mkdirSync(dirname(sibling), { recursive: true });
+    writeFileSync(current, "# current\n", "utf-8");
+    writeFileSync(sibling, "# sibling\n", "utf-8");
+    writeFileSync(
+      join(recordRoot, ".aidlc-reviewer-dispatch.json"),
+      JSON.stringify({
+        reviewer: "aidlc-architecture-reviewer-agent",
+        stage: "functional-design",
+        unit: "U01",
+        exempt: [],
+      }),
+      "utf-8",
+    );
+
+    const { client } = fakeClient({ reviewer: "main" });
+    const adapter = await createAdapter({ client, directory: root });
+    await adapter["chat.message"](
+      {
+        sessionID: "reviewer",
+        agent: "aidlc-architecture-reviewer-agent",
+      },
+      { parts: [{ type: "text", text: "review" }] },
+    );
+
+    const before = adapter["tool.execute.before"];
+    await expect(
+      before(
+        { tool: "read", sessionID: "reviewer", callID: "sibling" },
+        { args: { filePath: sibling } },
+      ),
+    ).rejects.toThrow(/This review cannot open/i);
+    await expect(
+      before(
+        { tool: "read", sessionID: "reviewer", callID: "current" },
+        { args: { filePath: current } },
+      ),
+    ).resolves.toBeUndefined();
+    await expect(
+      before(
+        { tool: "list", sessionID: "reviewer", callID: "sibling-list" },
+        { args: { path: dirname(sibling) } },
+      ),
+    ).rejects.toThrow(/This review cannot open/i);
+  });
+});
+
+describe("t241 OpenCode adapter state-transition guard", () => {
+  test("blocks direct lifecycle verbs and allows read-only state queries", async () => {
+    const root = freshProject();
+    copyCore(root, "hooks/aidlc-state-transition-guard.ts");
+    copyCore(root, "tools/aidlc-lib.ts");
+    copyCore(root, "tools/aidlc-artifact-vocabulary.ts");
+    copyCore(root, "tools/aidlc-runtime-paths.ts");
+
+    const { client } = fakeClient();
+    const adapter = await createAdapter({
+      client,
+      directory: root,
+      aidlcEntrypoints: new Set([
+        ...TEST_ENTRYPOINTS,
+        "tools/aidlc-orchestrate.ts",
+      ]),
+    });
+    const before = adapter["tool.execute.before"];
+    const invoke = (callID: string, command: string) =>
+      before(
+        { tool: "bash", sessionID: "main", callID },
+        { args: { command } },
+      );
+    await expect(
+      invoke("blocked", "bun .aidlc/tools/aidlc-state.ts approve user-stories"),
+    ).rejects.toThrow(/Stage status cannot be changed with aidlc-state\.ts approve/i);
+    await expect(
+      invoke("readonly", "bun .aidlc/tools/aidlc-state.ts show"),
+    ).resolves.toBeUndefined();
+    await expect(
+      invoke("engine", "bun .aidlc/tools/aidlc-orchestrate.ts next"),
+    ).resolves.toBeUndefined();
+  });
+
+  test("blocks lifecycle routing from a named AIDLC worker while preserving the main conductor", async () => {
+    const root = freshProject();
+    copyCore(root, "hooks/aidlc-state-transition-guard.ts");
+    copyCore(root, "tools/aidlc-lib.ts");
+    copyCore(root, "tools/aidlc-artifact-vocabulary.ts");
+    copyCore(root, "tools/aidlc-runtime-paths.ts");
+
+    const { client } = fakeClient({ worker: "main" });
+    const adapter = await createAdapter({
+      client,
+      directory: root,
+      aidlcEntrypoints: new Set([
+        ...TEST_ENTRYPOINTS,
+        "tools/aidlc-orchestrate.ts",
+      ]),
+    });
+    await adapter["chat.message"](
+      { sessionID: "worker", agent: "aidlc-design-agent" },
+      { parts: [{ type: "text", text: "contribute" }] },
+    );
+    const before = adapter["tool.execute.before"];
+    const command = "bun .aidlc/tools/aidlc-orchestrate.ts next --resume";
+
+    await expect(
+      before(
+        { tool: "bash", sessionID: "worker", callID: "worker-route" },
+        { args: { command } },
+      ),
+    ).rejects.toThrow(/only the main workflow session can change stage status or routing/i);
+    await expect(
+      before(
+        { tool: "bash", sessionID: "main", callID: "main-route" },
+        { args: { command } },
+      ),
+    ).resolves.toBeUndefined();
+  });
+});
+
+describe("t241 OpenCode adapter dispatch rules", () => {
+  test("task input is rewritten with exact active-stage rules", async () => {
+    const root = freshInstalledProject();
+    seedAidlcMemory(root);
+    seedStateFile(root, "state-mid-inception.md");
+    const { client } = fakeClient();
+    const adapter = await createAdapter({ client, directory: root });
+    const output = {
+      args: {
+        subagent_type: "aidlc-product-agent",
+        prompt:
+          "Run .aidlc/aidlc-common/stages/inception/user-stories.md.",
+        run_in_background: true,
+      },
+    };
+
+    await adapter["tool.execute.before"](
+      { tool: "task", sessionID: "main", callID: "rules" },
+      output,
+    );
+
+    const prompt = String(output.args.prompt ?? "");
+    expect(prompt).toContain("first-class");
+    expect(prompt).toContain("Given/When/Then");
+    expect(prompt).toContain("AIDLC_DISPATCH_RULES_BEGIN");
+    expect(inspectSubagentInflight(root).freshCount).toBe(1);
+
+    await adapter["tool.execute.after"]({
+      tool: "task",
+      sessionID: "main",
+      callID: "rules",
+      args: output.args,
+    });
+    expect(existsSync(subagentInflightMarkerPath(root))).toBe(false);
+  });
+});
+
+describe("t241 OpenCode native plan-approval payloads", () => {
+  test("write, bash, and developer task paths block before a human-owned receipt", async () => {
+    const root = freshInstalledProject();
+    seedAidlcMemory(root);
+    seedUnapprovedCodeGeneration(root);
+    const { client } = fakeClient();
+    const adapter = await createAdapter({ client, directory: root });
+    const before = adapter["tool.execute.before"];
+
+    await expect(
+      before(
+        { tool: "write", sessionID: "main", callID: "write" },
+        { args: { filePath: join(root, "src", "blocked.ts") } },
+      ),
+    ).rejects.toThrow(/plan|approval/i);
+    await expect(
+      before(
+        { tool: "bash", sessionID: "main", callID: "bash" },
+        { args: { command: "sort input.txt -o src/blocked.txt" } },
+      ),
+    ).rejects.toThrow(/plan|approval/i);
+    await expect(
+      before(
+        { tool: "task", sessionID: "main", callID: "task" },
+        {
+          args: {
+            subagent_type: "aidlc-developer-agent",
+            prompt:
+              "AIDLC-STAGE: code-generation\n" +
+              `AIDLC-TESTING-CONTRACT: sha256:${"a".repeat(64)}`,
+          },
+        },
+      ),
+    ).rejects.toThrow(/plan|approval/i);
+  });
+});
+
+describe("t241 OpenCode adapter write and session lifecycle", () => {
+  test("apply_patch emits audit then sensor calls for every affected path", async () => {
+    const root = freshProject();
+    const trace = join(root, "hook-calls.ndjson");
+    for (const [file, label] of [
+      ["aidlc-write-audit-log.ts", "audit"],
+      ["aidlc-run-sensors.ts", "sensor"],
+    ] as const) {
+      writeHook(
+        root,
+        file,
+        `import { appendFileSync } from "node:fs";
+const input = await Bun.stdin.text();
+appendFileSync(${JSON.stringify(trace)}, ${JSON.stringify(`${label}\t`)} + input + "\\n", "utf-8");
+`,
+      );
+    }
+    const patchText = `*** Begin Patch
+*** Add File: src/one.ts
++export const one = 1;
+*** Update File: src/two.ts
+@@
+-old
++next
+*** End Patch
+`;
+    const { client } = fakeClient();
+    const adapter = await createAdapter({ client, directory: root });
+    await adapter["tool.execute.after"](
+      postTool("apply_patch", { patchText }),
+    );
+
+    const calls = readFileSync(trace, "utf-8")
+      .trim()
+      .split("\n")
+      .map((line) => {
+        const [label, payload] = line.split("\t", 2);
+        return {
+          label,
+          path: (
+            JSON.parse(payload) as { tool_input: { file_path: string } }
+          ).tool_input.file_path,
+        };
+      });
+    expect(calls).toEqual([
+      { label: "audit", path: join(root, "src/one.ts") },
+      { label: "sensor", path: join(root, "src/one.ts") },
+      { label: "audit", path: join(root, "src/two.ts") },
+      { label: "sensor", path: join(root, "src/two.ts") },
+    ]);
+  });
+
+  test("relative apply_patch paths pass the real audit hook's absolute record gate", async () => {
+    const root = freshInstalledProject();
+    seedStateFile(root, "state-init-active.md");
+    mkdirSync(dirname(seededAuditShard(root)), { recursive: true });
+    writeFileSync(seededAuditShard(root), "# AI-DLC Audit Log\n", "utf-8");
+    const artifact = join(
+      seededRecordDir(root),
+      "initialization",
+      "state-init",
+      "state-notes.md",
+    );
+    mkdirSync(dirname(artifact), { recursive: true });
+    writeFileSync(artifact, "# state\n", "utf-8");
+    const patchText = `*** Begin Patch
+*** Add File: ${relative(root, artifact)}
++# state
+*** End Patch
+`;
+
+    const { client } = fakeClient();
+    const adapter = await createAdapter({ client, directory: root });
+    await adapter["tool.execute.after"](
+      postTool("apply_patch", { patchText }),
+    );
+
+    expect(readAudit(root)).toContain("ARTIFACT_CREATED");
+    expect(readAudit(root)).toContain("initialization > state-init > state-notes.md");
+  });
+
+  test("session-start retries until an active workflow is available, then stops retrying", async () => {
+    const root = freshProject();
+    const marker = join(root, "workflow-active");
+    const count = join(root, "session-start-count");
+    writeHook(
+      root,
+      "aidlc-session-start.ts",
+      `import { existsSync, readFileSync, writeFileSync } from "node:fs";
+const countFile = ${JSON.stringify(count)};
+const n = existsSync(countFile) ? Number(readFileSync(countFile, "utf-8")) : 0;
+writeFileSync(countFile, String(n + 1), "utf-8");
+await Bun.stdin.text();
+if (existsSync(${JSON.stringify(marker)})) {
+  process.stdout.write(JSON.stringify({ additionalContext: "active" }) + "\\n");
+}
+`,
+    );
+    writeHook(root, "aidlc-record-human-turn.ts", "await Bun.stdin.text();\n");
+
+    const { client } = fakeClient();
+    const adapter = await createAdapter({ client, directory: root });
+    const chat = adapter["chat.message"];
+    await chat(
+      { sessionID: "main" },
+      { parts: [{ type: "text", text: "first" }] },
+    );
+    expect(readFileSync(count, "utf-8")).toBe("1");
+
+    writeFileSync(marker, "", "utf-8");
+    await chat(
+      { sessionID: "main" },
+      { parts: [{ type: "text", text: "second" }] },
+    );
+    await chat(
+      { sessionID: "main" },
+      { parts: [{ type: "text", text: "third" }] },
+    );
+    expect(readFileSync(count, "utf-8")).toBe("2");
+  });
+
+  test("concurrent idle events inject one nudge for a session", async () => {
+    const root = freshProject();
+    const stopCount = join(root, "stop-count");
+    writeHook(
+      root,
+      "aidlc-session-start.ts",
+      `await Bun.stdin.text();
+process.stdout.write(JSON.stringify({ additionalContext: "active" }) + "\\n");
+`,
+    );
+    writeHook(root, "aidlc-record-human-turn.ts", "await Bun.stdin.text();\n");
+    writeHook(
+      root,
+      "aidlc-continue-workflow.ts",
+      `import { existsSync, readFileSync, writeFileSync } from "node:fs";
+const countFile = ${JSON.stringify(stopCount)};
+const n = existsSync(countFile) ? Number(readFileSync(countFile, "utf-8")) : 0;
+writeFileSync(countFile, String(n + 1), "utf-8");
+await Bun.stdin.text();
+await Bun.sleep(100);
+process.stdout.write(JSON.stringify({ decision: "block", reason: "continue" }) + "\\n");
+`,
+    );
+
+    const { client, prompts } = fakeClient();
+    const adapter = await createAdapter({ client, directory: root });
+    await adapter["chat.message"](
+      { sessionID: "main" },
+      { parts: [{ type: "text", text: "start" }] },
+    );
+    const idle = {
+      event: {
+        type: "session.idle",
+        properties: { sessionID: "main" },
+      },
+    };
+    await Promise.all([adapter.event(idle), adapter.event(idle)]);
+
+    expect(readFileSync(stopCount, "utf-8")).toBe("1");
+    expect(prompts).toHaveLength(1);
+    expect(prompts[0].text).toContain("continue");
+  });
+
+  test("session idle forwards the session id to the Stop hook", async () => {
+    const root = freshProject();
+    const stopInput = join(root, "stop-input.json");
+    writeHook(
+      root,
+      "aidlc-session-start.ts",
+      `await Bun.stdin.text();
+process.stdout.write(JSON.stringify({ additionalContext: "active" }) + "\\n");
+`,
+    );
+    writeHook(root, "aidlc-record-human-turn.ts", "await Bun.stdin.text();\n");
+    writeHook(
+      root,
+      "aidlc-continue-workflow.ts",
+      `import { writeFileSync } from "node:fs";
+writeFileSync(${JSON.stringify(stopInput)}, await Bun.stdin.text(), "utf-8");
+`,
+    );
+
+    const { client } = fakeClient();
+    const adapter = await createAdapter({ client, directory: root });
+    await adapter["chat.message"](
+      { sessionID: "main" },
+      { parts: [{ type: "text", text: "start" }] },
+    );
+    await adapter.event({
+      event: {
+        type: "session.idle",
+        properties: { sessionID: "main" },
+      },
+    });
+
+    const payload = JSON.parse(readFileSync(stopInput, "utf-8")) as {
+      session_id?: string;
+    };
+    expect(payload.session_id).toBe("main");
+  });
+
+  test("turn-one idle reaches the real Stop hook when workflow state is created during the turn", async () => {
+    const root = freshInstalledProject();
+    const { client, prompts } = fakeClient();
+    const adapter = await createAdapter({ client, directory: root });
+
+    await adapter["chat.message"](
+      { sessionID: "main" },
+      { parts: [{ type: "text", text: "start a workflow" }] },
+    );
+    seedStateFile(root, "state-init-active.md");
+    // The direct fixture write stands in for intent-create, so mirror the
+    // production writer that replaces the cold intent:null binding.
+    writeSessionBinding(
+      root,
+      "main",
+      "default",
+      basename(seededRecordDir(root)),
+    );
+    await adapter.event({
+      event: {
+        type: "session.idle",
+        properties: { sessionID: "main" },
+      },
+    });
+
+    expect(prompts).toHaveLength(1);
+    expect(prompts[0].text).toContain("[aidlc-forwarding-nudge]");
+  });
+
+  test("idle suppresses its nudge for an open logged question and restores it after the answer", async () => {
+    const root = freshInstalledProject();
+    seedStateFile(root, "state-brownfield-feature.md");
+    appendInteractionEvent(root, "STAGE_STARTED", "requirements-analysis");
+    appendInteractionEvent(root, "DECISION_RECORDED", "requirements-analysis");
+    const { client, prompts } = fakeClient();
+    const adapter = await createAdapter({ client, directory: root });
+
+    await adapter["chat.message"](
+      { sessionID: "main" },
+      { parts: [{ type: "text", text: "start" }] },
+    );
+    const idle = {
+      event: {
+        type: "session.idle",
+        properties: { sessionID: "main" },
+      },
+    };
+    await adapter.event(idle);
+    expect(prompts).toHaveLength(0);
+
+    appendInteractionEvent(root, "QUESTION_ANSWERED", "requirements-analysis");
+    await adapter.event(idle);
+    expect(prompts).toHaveLength(1);
+    expect(prompts[0].text).toContain("[aidlc-forwarding-nudge]");
+  });
+
+  test("a transient child lookup failure is not cached as a main session", async () => {
+    const root = freshProject();
+    const minted = join(root, "minted");
+    writeHook(root, "aidlc-session-start.ts", "await Bun.stdin.text();\n");
+    writeHook(
+      root,
+      "aidlc-record-human-turn.ts",
+      `import { appendFileSync } from "node:fs";
+await Bun.stdin.text();
+appendFileSync(${JSON.stringify(minted)}, "mint\\n");
+`,
+    );
+    let lookups = 0;
+    const client: PluginInput["client"] = {
+      session: {
+        get: async () => {
+          lookups += 1;
+          if (lookups === 1) throw new Error("transient");
+          return { data: { parentID: "main" } };
+        },
+        prompt: async () => {},
+      },
+    };
+    const adapter = await createAdapter({ client, directory: root });
+
+    for (const text of ["first", "second"]) {
+      await adapter["chat.message"](
+        { sessionID: "child" },
+        { parts: [{ type: "text", text }] },
+      );
+    }
+
+    expect(lookups).toBe(2);
+    expect(() => readFileSync(minted, "utf-8")).toThrow();
+  });
+
+  test("idle serialization is released before a nudge prompt delivers the next idle", async () => {
+    const root = freshProject();
+    const stopCount = join(root, "stop-count");
+    writeHook(
+      root,
+      "aidlc-session-start.ts",
+      `await Bun.stdin.text();
+process.stdout.write(JSON.stringify({ additionalContext: "active" }) + "\\n");
+`,
+    );
+    writeHook(root, "aidlc-record-human-turn.ts", "await Bun.stdin.text();\n");
+    writeHook(
+      root,
+      "aidlc-continue-workflow.ts",
+      `import { existsSync, readFileSync, writeFileSync } from "node:fs";
+const countFile = ${JSON.stringify(stopCount)};
+const n = existsSync(countFile) ? Number(readFileSync(countFile, "utf-8")) : 0;
+writeFileSync(countFile, String(n + 1), "utf-8");
+await Bun.stdin.text();
+if (n === 0) process.stdout.write(JSON.stringify({ decision: "block", reason: "continue" }) + "\\n");
+`,
+    );
+    let adapter: Awaited<ReturnType<typeof createAdapter>>;
+    const client: PluginInput["client"] = {
+      session: {
+        get: async () => ({ data: {} }),
+        prompt: async ({ path }) => {
+          await adapter.event({
+            event: {
+              type: "session.idle",
+              properties: { sessionID: path.id },
+            },
+          });
+        },
+      },
+    };
+    adapter = await createAdapter({ client, directory: root });
+    await adapter["chat.message"](
+      { sessionID: "main" },
+      { parts: [{ type: "text", text: "start" }] },
+    );
+    await adapter.event({
+      event: {
+        type: "session.idle",
+        properties: { sessionID: "main" },
+      },
+    });
+
+    expect(readFileSync(stopCount, "utf-8")).toBe("2");
+  });
+});
