@@ -1,0 +1,118 @@
+// covers: file:skills/aidlc/SKILL.md
+//
+// t-run-opencode-status.serial.test.ts — drive `/aidlc --status` through
+// opencode's headless surface (`opencode run --command aidlc`) against the
+// SHIPPED dist/opencode tree, and assert on the engine's real outputs. The
+// opencode-run driver is the structured "logic half" for the opencode harness
+// — the analogue of codex's exec driver (no tmux, no painted screen; the
+// model's final message + the project's on-disk state are the observables).
+//
+// LIVE-PROVEN (2026-07-12, opencode 1.17.18 on Bedrock): the same rig shape
+// ran skill + subagent discovery, this status journey, AND a real intent
+// creation (scope ask → poc → intent-create → first run-stage directive with the
+// conductor persona) — transcripts in the build session. This test pins the
+// cheap status journey so CI can re-verify the shipped tree end-to-end
+// without burning a whole workflow.
+//
+// SCOPE: the no-state case ONLY (status with no workflow = print-directive
+// terminal arm — turn-stable). With an ACTIVE workflow the conductor may
+// legitimately resume it inside the same run turn (the forwarding loop lives
+// in-turn), so a with-state "status is read-only" assert is not turn-stable
+// here — same carve-out as the codex exec twin.
+//
+// What this proves on the SHIPPED tree, structurally:
+//   - the /aidlc command entry (.opencode/command/aidlc.md) resolves and
+//     forwards $ARGUMENTS;
+//   - skill discovery from .aidlc/skills via the shipped opencode.json
+//     skills.paths (the engine-outside-.opencode layout works live);
+//   - the engine's print-directive terminal arm (status names no workflow);
+//   - nothing is scaffolded by a read-only utility.
+//
+// LIVE GATE: requires AIDLC_OPENCODE_RUN_LIVE=1 + an opencode >= 1.17 binary
+// (AIDLC_OPENCODE_BIN or PATH) + a configured model provider in the user's
+// GLOBAL opencode config (the shipped project opencode.json pins no model;
+// AIDLC_OPENCODE_MODEL overrides, default Bedrock Sonnet). Skips cleanly
+// otherwise.
+
+import { describe, expect, test } from "bun:test";
+import { spawnSync } from "node:child_process";
+import { existsSync, rmSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
+import {
+  runOpencode,
+  setupOpencodeProject,
+} from "../harness/exec-drive.ts";
+import { REPO_ROOT } from "../harness/fixtures.ts";
+
+const OPENCODE_DIST = join(REPO_ROOT, "dist", "opencode");
+const OPENCODE_BIN = process.env.AIDLC_OPENCODE_BIN ?? "opencode";
+const MODEL =
+  process.env.AIDLC_OPENCODE_MODEL ?? "amazon-bedrock/global.anthropic.claude-sonnet-4-6";
+
+const TIMEOUT_S = Number.parseInt(process.env.AIDLC_TEST_TIMEOUT ?? "600", 10);
+const TEST_TIMEOUT_MS = (Number.isFinite(TIMEOUT_S) ? TIMEOUT_S : 600) * 1000;
+
+function opencodeVersionOk(): boolean {
+  const r = spawnSync(OPENCODE_BIN, ["--version"], { encoding: "utf-8" });
+  const m = (r.stdout ?? "").match(/(\d+)\.(\d+)\.(\d+)/);
+  if (r.status !== 0 || !m) return false;
+  const [maj, min] = [Number(m[1]), Number(m[2])];
+  return maj > 1 || (maj === 1 && min >= 17);
+}
+
+function skipReason(): string | null {
+  if (process.env.AIDLC_OPENCODE_RUN_LIVE !== "1") {
+    return "set AIDLC_OPENCODE_RUN_LIVE=1 to run the live opencode-run journey (uses your provider)";
+  }
+  if (!opencodeVersionOk()) return `opencode >= 1.17 not found (AIDLC_OPENCODE_BIN=${OPENCODE_BIN})`;
+  if (!existsSync(OPENCODE_DIST)) return `distributable missing: ${OPENCODE_DIST}`;
+  // opencode's Bedrock provider needs static credentials in the environment or
+  // ~/.aws/ — unlike Claude Code it does not walk the EC2 instance-role (IMDS)
+  // chain, so a role-only box hard-fails at the provider instead of skipping.
+  // Key on the MODEL actually in use (it defaults to Bedrock regardless of
+  // CLAUDE_CODE_USE_BEDROCK, which configures Claude Code, not opencode).
+  // Other providers authenticate their own way.
+  if (
+    MODEL.startsWith("amazon-bedrock/") &&
+    !process.env.AWS_ACCESS_KEY_ID &&
+    !process.env.AWS_PROFILE &&
+    !existsSync(join(homedir(), ".aws", "credentials"))
+  ) {
+    return "Bedrock is the provider but no static AWS credentials are visible to opencode (env keys, AWS_PROFILE, or ~/.aws/credentials); materialize instance-role creds into AWS_ACCESS_KEY_ID/SECRET/SESSION_TOKEN to run live";
+  }
+  return null;
+}
+const SKIP_REASON = skipReason();
+
+describe("t-run-opencode-status — /aidlc --status on the shipped dist/opencode via opencode run", () => {
+  test.skipIf(SKIP_REASON !== null)(
+    `no-state: status renders 'no active workflow' and scaffolds nothing${SKIP_REASON ? ` [SKIP: ${SKIP_REASON}]` : ""}`,
+    () => {
+      const { proj, root } = setupOpencodeProject();
+      try {
+        const r = runOpencode(proj, ["--status"]);
+        // Surface the CLI's own output on a non-zero exit — the observable
+        // that names the failure (provider auth, config rejection, crash).
+        expect({ rc: r.rc, tail: r.rc === 0 ? "" : r.out.slice(-2000) }).toEqual({
+          rc: 0,
+          tail: "",
+        });
+        // The engine's no-workflow status text, surfaced verbatim by the
+        // print-directive terminal arm.
+        expect(r.out.toLowerCase()).toContain("no active");
+        // Read-only: the status path must not scaffold a workflow. The
+        // shipped aidlc/ workspace shell (spaces/default/memory + the
+        // active-space cursor) is part of the install; the workflow signals
+        // are an intent record (state file) and the per-intent scaffold.
+        expect(existsSync(join(proj, "aidlc", "spaces", "default", "intents", "intents.json"))).toBe(
+          false,
+        );
+        expect(existsSync(join(proj, "aidlc-docs"))).toBe(false);
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    TEST_TIMEOUT_MS,
+  );
+});

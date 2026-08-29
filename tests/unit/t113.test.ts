@@ -1,0 +1,871 @@
+// covers: function:validateDirective
+//
+// t113 — Directive schema + validator. Migrated from the bash TAP test
+// tests/unit/t113-directive-schema.sh (plan 30). The original spawned `bun -e`
+// once per case, importing validateDirective from aidlc-directive.ts and
+// stringifying the ValidationResult as "VALID" / "INVALID:<errors joined by |>"
+// so bash could grep it. The module is a PURE contract — "no emit, no consume,
+// reads/writes NO state, no I/O" (aidlc-directive.ts:9) — so every one of the
+// 30 behavioural assertions can be exercised in-process by importing and
+// CALLING validateDirective directly. The .ts file does have an
+// `if (import.meta.main)` CLI self-check (aidlc-directive.ts:396), but the .sh
+// never drives the CLI seam — it always imports validateDirective via `bun -e`.
+// So this is a `.none.test.ts` (mechanism = none): pure function calls, zero
+// subprocess, zero LLM, zero tokens.
+//
+// PARITY NOTE on the .sh "VALID" / "INVALID:..." string protocol: the original
+// reduced the ValidationResult discriminated union to a single line via the
+// run_validator helper (t113-directive-schema.sh:60-67) so bash could grep it.
+// In-process we assert the union directly — `result.valid` (boolean) and either
+// `result.data` (on success) or `result.errors` (string[]) on failure.
+//   - assert_eq "$OUT" "VALID"            -> expect(result.valid).toBe(true)
+//   - assert_contains "$OUT" "<substr>"   -> expect(errs(...)).toContain("<substr>")
+// where errs() reproduces run_validator's reduction. Same observable behaviour
+// (the substring is present in the surfaced error set), asserted against the
+// real return value rather than its stringification.
+//
+// The .sh used `delete d.field` and object-spread mutation against inline JS
+// fixture expressions. In-process each fixture is a function returning a fresh
+// deep object, so no case can leak mutation into another — the equivalent of
+// the .sh re-evaluating the inline expression per run_validator call.
+
+import { describe, expect, test } from "bun:test";
+import {
+  type Directive,
+  validateDirective,
+} from "../../dist/claude/.claude/tools/aidlc-directive.ts";
+
+// --- Well-formed fixtures, one per kind (mirror t113-directive-schema.sh:18-56) ---
+// Fresh object per call so a `delete`/spread in one case can't bleed into another.
+
+function loadSteering(): Record<string, unknown> {
+  return {
+    kind: "load-steering",
+    stage: "application-design",
+    bundle: "sha256:0123456789abcdef",
+    part: 1,
+    parts: 2,
+    rules_content: [
+      { path: "aidlc/spaces/default/memory/org.md", text: "# Organization\n" },
+    ],
+    continue_token: "opaque-token",
+  };
+}
+
+function runStage(): Record<string, unknown> {
+  return {
+    kind: "run-stage",
+    stage: "application-design",
+    phase: "inception",
+    lead_agent: "aidlc-architect-agent",
+    support_agents: ["aidlc-aws-platform-agent", "aidlc-design-agent"],
+    mode: "inline",
+    inline_context_paths: [
+      ".claude/agents/aidlc-architect-agent.md",
+      ".claude/agents/aidlc-aws-platform-agent.md",
+      ".claude/agents/aidlc-design-agent.md",
+    ],
+    gate: true,
+    memory_path: "aidlc-docs/inception/application-design/memory.md",
+    consumes: ["aidlc-docs/inception/requirements/requirements.md"],
+    produces: ["aidlc-docs/inception/application-design/decisions.md"],
+    rules_in_context: ["aidlc-org.md", "aidlc-team.md"],
+    sensors_applicable: ["required-sections"],
+    stage_file: ".claude/skills/aidlc/stages/inception/application-design.md",
+  };
+}
+
+function wave() {
+  return {
+    batch_index: 0,
+    entries: [
+      {
+        unit: "auth",
+        unit_kind: "service",
+        build_required: true,
+        completion_required: true,
+        review_state: "outstanding",
+        review_iteration: 1,
+        unit_memory_path:
+          "aidlc-docs/construction/auth/functional-design/memory.md",
+        consumes: ["aidlc-docs/inception/requirements/requirements.md"],
+        consumes_absent: [],
+        produces: [
+          "aidlc-docs/construction/auth/functional-design/business-logic-model.md",
+        ],
+        required_produces: [
+          "aidlc-docs/construction/auth/functional-design/business-logic-model.md",
+        ],
+      },
+    ],
+  };
+}
+
+function dispatchSubagent(): Record<string, unknown> {
+  return {
+    kind: "dispatch-subagent",
+    stage: "code-generation",
+    phase: "construction",
+    lead_agent: "aidlc-developer-agent",
+    support_agents: ["aidlc-quality-agent"],
+    mode: "subagent",
+    inline_context_paths: [],
+    gate: false,
+    memory_path: "aidlc-docs/construction/auth/code-generation/memory.md",
+    consumes: [
+      "aidlc-docs/construction/auth/functional-design/functional-design.md",
+    ],
+    produces: ["aidlc-docs/construction/auth/code-generation/code-manifest.md"],
+    rules_in_context: ["aidlc-org.md"],
+    sensors_applicable: ["linter"],
+    stage_file: ".claude/skills/aidlc/stages/construction/code-generation.md",
+    worker: "code-generation",
+  };
+}
+
+function invokeSwarm(): Record<string, unknown> {
+  return {
+    kind: "invoke-swarm",
+    units: ["auth", "billing"],
+    stage: "code-generation",
+    stage_file: ".claude/aidlc-common/stages/construction/code-generation.md",
+    reviewer: "aidlc-architecture-reviewer-agent",
+    review_artifact: "code-generation-plan",
+    reviewer_max_iterations: 2,
+  };
+}
+
+function presentGate(): Record<string, unknown> {
+  return {
+    kind: "present-gate",
+    stage: "application-design",
+    phase: "inception",
+    memory_path: "aidlc-docs/inception/application-design/memory.md",
+  };
+}
+
+function ask(): Record<string, unknown> {
+  return { kind: "ask", question: "Resume from the last checkpoint, or start fresh?" };
+}
+
+function newWorkRoutingAsk(): Record<string, unknown> {
+  return {
+    kind: "ask",
+    ask_type: "new-work-routing",
+    response_route: "next",
+    question: "Continue, start separate work, or reshape the plan?",
+    numbered_prose_question:
+      "1. Continue\n2. Separate\n3. Reshape\n4. Other",
+    new_work_description: "build a standalone metrics dashboard",
+    proposed_scope: "feature",
+  };
+}
+
+function unselectedNewWorkRoutingAsk(): Record<string, unknown> {
+  return {
+    ...newWorkRoutingAsk(),
+    available_intents: ["fixture", "auth-refresh"],
+  };
+}
+
+function legacyPlanApprovalRecoveryAsk(): Record<string, unknown> {
+  return {
+    kind: "ask",
+    question:
+      "Recover the current legacy Code Generation Plan Approval capability?",
+    ask_type: "legacy-plan-approval-recovery",
+    response_route: "next",
+    recovery_choice: "Recover Plan Approval",
+  };
+}
+
+function print(): Record<string, unknown> {
+  return { kind: "print", message: "AIDLC framework version 0.0.0" };
+}
+
+function error(): Record<string, unknown> {
+  return { kind: "error", message: "Unknown scope" };
+}
+
+function done(): Record<string, unknown> {
+  return { kind: "done", reason: "Workflow complete." };
+}
+
+function parked(): Record<string, unknown> {
+  return { kind: "parked", reason: "Parked at feasibility.", stage: "feasibility" };
+}
+
+// Mirror of the .sh run_validator helper (t113-directive-schema.sh:60-67):
+// call the validator and reduce the failure case to the pipe-joined error
+// string the original asserted against. On success return "VALID".
+function errs(obj: unknown): string {
+  const r = validateDirective(obj);
+  return r.valid ? "VALID" : r.errors.join("|");
+}
+
+describe("t113 directive-schema — validateDirective (migrated from t113-directive-schema.sh, plan 26)", () => {
+  // ============================================================
+  // Positive baseline — a well-formed directive of each kind (8 assertions)
+  // .sh lines 75-82
+  // ============================================================
+
+  test("load-steering well-formed -> VALID", () => {
+    expect(validateDirective(loadSteering()).valid).toBe(true);
+  });
+
+  test("run-stage well-formed -> VALID", () => {
+    expect(validateDirective(runStage()).valid).toBe(true);
+  });
+
+  test("Code Generation directives validate matching legacy Plan Approval choices", () => {
+    const choices = {
+      approve: "Approve Plan [0123456789ab]",
+      request_changes: "Request Changes [0123456789ab]",
+    };
+    expect(
+      errs({
+        ...runStage(),
+        stage: "code-generation",
+        legacy_plan_approval_choices: choices,
+      }),
+    ).toBe("VALID");
+    expect(
+      errs({
+        ...invokeSwarm(),
+        legacy_plan_approval_choices: choices,
+      }),
+    ).toBe("VALID");
+    expect(
+      errs({
+        ...runStage(),
+        legacy_plan_approval_choices: {
+          ...choices,
+          request_changes: "Request Changes [fedcba987654]",
+        },
+      }),
+    ).toContain(
+      "legacy_plan_approval_choices must carry matching protected choice labels",
+    );
+    expect(
+      errs({
+        ...dispatchSubagent(),
+        legacy_plan_approval_choices: choices,
+      }),
+    ).toContain(
+      "dispatch-subagent: unknown key: legacy_plan_approval_choices",
+    );
+  });
+
+  test("run-stage accepts validated protocol module hints", () => {
+    expect(
+      errs({
+        ...runStage(),
+        protocol_modules: ["reviewer", "ensemble", "construction"],
+      }),
+    ).toBe("VALID");
+  });
+
+  test("run-stage accepts only literal true for the settled-swarm marker", () => {
+    expect(
+      errs({
+        ...runStage(),
+        protocol_modules: ["construction", "swarm"],
+        swarm_settled: true,
+      }),
+    ).toBe("VALID");
+    expect(errs({ ...runStage(), swarm_settled: false })).toContain(
+      "run-stage: swarm_settled must be true when present",
+    );
+  });
+
+  test("run-stage rejects unknown protocol module hints", () => {
+    expect(
+      errs({
+        ...runStage(),
+        protocol_modules: ["reviewer", "unknown"],
+      }),
+    ).toContain(
+      "run-stage: protocol_modules[1] must be one of reviewer | ensemble | construction | swarm",
+    );
+  });
+
+  test("dispatch-subagent well-formed -> VALID", () => {
+    expect(validateDirective(dispatchSubagent()).valid).toBe(true);
+  });
+
+  test("invoke-swarm well-formed -> VALID", () => {
+    expect(validateDirective(invokeSwarm()).valid).toBe(true);
+  });
+
+  test("invoke-swarm accepts construction/swarm protocol module hints", () => {
+    expect(
+      errs({
+        ...invokeSwarm(),
+        protocol_modules: ["reviewer", "construction", "swarm"],
+      }),
+    ).toBe("VALID");
+  });
+
+  // M1: the optional `repo` field (single-recorded-repo case) — the engine
+  // threads the lone sibling repo to the conductor as `prepare --repo`. repo is
+  // optional, so a directive carrying it (well-formed string) must still validate.
+  test("invoke-swarm with optional repo -> VALID", () => {
+    const d = invokeSwarm();
+    d.repo = "repo-a";
+    expect(errs(d)).toBe("VALID");
+  });
+
+  test("invoke-swarm rejects a non-positive reviewer iteration cap", () => {
+    const d = invokeSwarm();
+    d.reviewer_max_iterations = 0;
+    expect(errs(d)).toContain(
+      "invoke-swarm: reviewer_max_iterations must be a positive integer",
+    );
+  });
+
+  test("present-gate well-formed -> VALID", () => {
+    expect(validateDirective(presentGate()).valid).toBe(true);
+  });
+
+  test("ask well-formed -> VALID", () => {
+    expect(validateDirective(ask()).valid).toBe(true);
+  });
+
+  test("new-work-routing ask carries its direct next response contract", () => {
+    expect(validateDirective(newWorkRoutingAsk()).valid).toBe(true);
+  });
+
+  test("new-work-routing ask accepts engine-listed unselected intents", () => {
+    expect(validateDirective(unselectedNewWorkRoutingAsk()).valid).toBe(true);
+    expect(
+      errs({ ...unselectedNewWorkRoutingAsk(), available_intents: ["fixture", 42] }),
+    ).toContain("ask: available_intents[1] must be string");
+  });
+
+  test("legacy Plan Approval recovery ask carries one exact human takeover choice", () => {
+    expect(validateDirective(legacyPlanApprovalRecoveryAsk()).valid).toBe(true);
+    expect(
+      errs({
+        ...legacyPlanApprovalRecoveryAsk(),
+        recovery_choice: "Approve Plan",
+      }),
+    ).toContain(
+      'legacy-plan-approval-recovery recovery_choice must be "Recover Plan Approval"',
+    );
+  });
+
+  test("new-work-routing ask rejects a report response route", () => {
+    expect(
+      errs({ ...newWorkRoutingAsk(), response_route: "report" }),
+    ).toContain('ask: new-work-routing response_route must be "next"');
+  });
+
+  test("new-work route metadata requires the typed ask subtype", () => {
+    expect(
+      errs({
+        ...ask(),
+        response_route: "next",
+        new_work_description: "standalone dashboard",
+        proposed_scope: "feature",
+        available_intents: ["fixture"],
+        numbered_prose_question: "1. Continue\n2. Separate\n3. Reshape\n4. Other",
+      }),
+    ).toContain('ask: response_route requires ask_type "new-work-routing"');
+  });
+
+  test("print well-formed -> VALID", () => {
+    expect(validateDirective(print()).valid).toBe(true);
+  });
+
+  test("error well-formed -> VALID", () => {
+    expect(validateDirective(error()).valid).toBe(true);
+  });
+
+  test("done well-formed -> VALID", () => {
+    expect(validateDirective(done()).valid).toBe(true);
+  });
+
+  test("parked well-formed -> VALID", () => {
+    expect(validateDirective(parked()).valid).toBe(true);
+  });
+
+  // ============================================================
+  // Positive returns the parsed directive as data (1 assertion)
+  // .sh lines 88-93: `kind=` + r.data.kind
+  // ============================================================
+
+  test("valid run-stage -> data.kind returned", () => {
+    const r = validateDirective(runStage());
+    expect(r.valid).toBe(true);
+    // narrowed by valid===true; data aliases the input per the validator's
+    // documented trust boundary (aidlc-directive.ts:281-288).
+    const data = (r as { valid: true; data: Directive }).data;
+    expect(data.kind).toBe("run-stage");
+  });
+
+  // ============================================================
+  // Per-kind missing required field — names the field + kind (8 assertions)
+  // .sh lines 99-121
+  // ============================================================
+
+  test("load-steering missing continue_token -> error", () => {
+    const d = loadSteering();
+    delete d.continue_token;
+    expect(errs(d)).toContain(
+      "load-steering: missing required field: continue_token",
+    );
+  });
+
+  test("run-stage missing lead_agent -> error", () => {
+    const d = runStage();
+    delete d.lead_agent;
+    expect(errs(d)).toContain("run-stage: missing required field: lead_agent");
+  });
+
+  test("dispatch-subagent missing worker -> error", () => {
+    const d = dispatchSubagent();
+    delete d.worker;
+    expect(errs(d)).toContain(
+      "dispatch-subagent: missing required field: worker",
+    );
+  });
+
+  test("invoke-swarm missing units -> error", () => {
+    const d = invokeSwarm();
+    delete d.units;
+    expect(errs(d)).toContain("invoke-swarm: missing required field: units");
+  });
+
+  test("present-gate missing memory_path -> error", () => {
+    const d = presentGate();
+    delete d.memory_path;
+    expect(errs(d)).toContain(
+      "present-gate: missing required field: memory_path",
+    );
+  });
+
+  test("ask missing question -> error", () => {
+    const d = ask();
+    delete d.question;
+    expect(errs(d)).toContain("ask: missing required field: question");
+  });
+
+  test("print missing message -> error", () => {
+    const d = print();
+    delete d.message;
+    expect(errs(d)).toContain("print: missing required field: message");
+  });
+
+  test("error missing message -> error", () => {
+    const d = error();
+    delete d.message;
+    expect(errs(d)).toContain("error: missing required field: message");
+  });
+
+  test("done missing reason -> error", () => {
+    const d = done();
+    delete d.reason;
+    expect(errs(d)).toContain("done: missing required field: reason");
+  });
+
+  test("parked missing stage -> error", () => {
+    const d = parked();
+    delete d.stage;
+    expect(errs(d)).toContain("parked: missing required field: stage");
+  });
+
+  // ============================================================
+  // Unknown kind (1 assertion)
+  // .sh lines 127-128
+  // ============================================================
+
+  test("unknown kind -> specific error", () => {
+    expect(errs({ kind: "frobnicate", message: "x" })).toContain(
+      'unknown kind: "frobnicate"',
+    );
+  });
+
+  // ============================================================
+  // Unknown key on a valid run-stage (1 assertion)
+  // .sh lines 134-135
+  // ============================================================
+
+  test("unknown key on run-stage -> error", () => {
+    expect(errs({ ...runStage(), bogus: "x" })).toContain(
+      "run-stage: unknown key: bogus",
+    );
+  });
+
+  // ============================================================
+  // Type mismatches (3 assertions)
+  // .sh lines 141-148
+  // ============================================================
+
+  test("run-stage gate 'yes' -> boolean type error", () => {
+    expect(errs({ ...runStage(), gate: "yes" })).toContain(
+      'run-stage: gate must be boolean or "unresolved", got string',
+    );
+  });
+
+  test("load-steering rejects part beyond parts", () => {
+    expect(errs({ ...loadSteering(), part: 3, parts: 2 })).toContain(
+      "load-steering: part must be less than or equal to parts",
+    );
+  });
+
+  test("load-steering validates path/text entry shape", () => {
+    expect(
+      errs({
+        ...loadSteering(),
+        rules_content: [{ path: 42, text: false }],
+      }),
+    ).toContain(
+      "load-steering: rules_content[0].path must be string, got number",
+    );
+  });
+
+  test("run-stage single true -> VALID", () => {
+    expect(errs({ ...runStage(), single: true, gate: false })).toBe("VALID");
+  });
+
+  test("run-stage single non-boolean -> type error", () => {
+    expect(errs({ ...runStage(), single: "yes" })).toContain(
+      "run-stage: single must be boolean, got string",
+    );
+  });
+
+  test("run-stage review_class validates the advisory/adversarial enum", () => {
+    expect(
+      errs({
+        ...runStage(),
+        reviewer: "aidlc-product-lead-agent",
+        review_artifact: "decisions",
+        reviewer_max_iterations: 1,
+        review_class: "advisory",
+      }),
+    ).toBe("VALID");
+    expect(errs({ ...runStage(), review_class: "none" })).toContain(
+      "run-stage: review_class must be one of adversarial | advisory",
+    );
+    expect(errs({ ...runStage(), review_class: 1 })).toContain(
+      "run-stage: review_class must be string, got number",
+    );
+    expect(errs({ ...runStage(), review_class: "advisory" })).toContain(
+      "run-stage: review_class requires reviewer",
+    );
+  });
+
+  test("run-stage accepts a complete engine-resolved wave entry", () => {
+    expect(
+      errs({
+        ...runStage(),
+        unit: "auth",
+        gate: false,
+        wave: wave(),
+      }),
+    ).toBe("VALID");
+  });
+
+  test("run-stage wave validates completion and retry state fields", () => {
+    const malformed = structuredClone(wave());
+    malformed.entries[0].completion_required = "yes" as unknown as boolean;
+    malformed.entries[0].review_state =
+      "stale" as typeof malformed.entries[0]["review_state"];
+    const result = errs({ ...runStage(), wave: malformed });
+    expect(result).toContain(
+      "run-stage: wave.entries[0].completion_required must be boolean",
+    );
+    expect(result).toContain(
+      "run-stage: wave.entries[0].review_state must be one of",
+    );
+
+    const retry = structuredClone(wave());
+    retry.entries[0].build_required = false;
+    retry.entries[0].review_state =
+      "retry-required" as typeof retry.entries[0]["review_state"];
+    expect(errs({ ...runStage(), wave: retry })).toBe("VALID");
+
+    for (const state of ["recovery-required", "escalation-required"] as const) {
+      const recovery = structuredClone(wave());
+      recovery.entries[0].build_required = false;
+      recovery.entries[0].review_state =
+        state as typeof recovery.entries[0]["review_state"];
+      expect(errs({ ...runStage(), wave: recovery })).toBe("VALID");
+    }
+  });
+
+  test("invoke-swarm review_class validates the advisory/adversarial enum", () => {
+    expect(errs({ ...invokeSwarm(), review_class: "adversarial" })).toBe(
+      "VALID",
+    );
+    expect(errs({ ...invokeSwarm(), review_class: "none" })).toContain(
+      "invoke-swarm: review_class must be one of adversarial | advisory",
+    );
+    expect(errs({ ...invokeSwarm(), reviewer: undefined, review_class: "advisory" })).toContain(
+      "invoke-swarm: review_class requires reviewer",
+    );
+  });
+
+  test("dispatch-subagent rejects the single-only marker", () => {
+    expect(errs({ ...dispatchSubagent(), single: true })).toContain(
+      "dispatch-subagent: unknown key: single",
+    );
+  });
+
+  test("run-stage support_agents 'x' -> array type error", () => {
+    expect(errs({ ...runStage(), support_agents: "x" })).toContain(
+      "run-stage: support_agents must be array, got string",
+    );
+  });
+
+  test("ask question 42 -> string type error", () => {
+    expect(errs({ ...ask(), question: 42 })).toContain(
+      "ask: question must be string, got number",
+    );
+  });
+
+  // ============================================================
+  // The classify-round-trip gate sentinel + conductor_persona (4 assertions)
+  // .sh lines 162-173
+  // ============================================================
+  // The engine emits gate:"unresolved" for the one Construction skeleton stage
+  // it cannot pre-classify; the conductor resolves it on the round trip
+  // (aidlc-directive.ts:31, :65, GATE_UNRESOLVED at :37). checkGate (:373-389)
+  // accepts boolean OR the exact sentinel string and rejects every other string
+  // so a typo'd sentinel surfaces loudly rather than being acted on as a
+  // deferred gate. conductor_persona is the optional D-E delivery field
+  // (aidlc-directive.ts:75-80, :100-101), validated by checkOptionalString
+  // (:393-403) — absent is fine, present-and-string is VALID, present-and-non-
+  // string is rejected.
+
+  test('run-stage gate:"unresolved" sentinel -> VALID (classify round-trip)', () => {
+    // .sh line 162-163: the sentinel is the ONLY accepted gate string.
+    expect(errs({ ...runStage(), gate: "unresolved" })).toBe("VALID");
+    expect(validateDirective({ ...runStage(), gate: "unresolved" }).valid).toBe(
+      true,
+    );
+  });
+
+  test('run-stage gate:"maybe" (non-sentinel string) -> rejected', () => {
+    // .sh line 164-166: any OTHER gate-string is rejected with the same
+    // boolean-or-sentinel type error a non-string would produce — a typo'd
+    // sentinel must NOT be silently accepted as a deferred gate.
+    const r = validateDirective({ ...runStage(), gate: "maybe" });
+    expect(r.valid).toBe(false);
+    expect(errs({ ...runStage(), gate: "maybe" })).toContain(
+      'run-stage: gate must be boolean or "unresolved", got string',
+    );
+  });
+
+  test("run-stage conductor_persona string -> VALID (D-E first-next delivery)", () => {
+    // .sh line 169-170: conductor_persona present as a string is accepted.
+    expect(errs({ ...runStage(), conductor_persona: "# Persona" })).toBe(
+      "VALID",
+    );
+    expect(
+      validateDirective({ ...runStage(), conductor_persona: "# Persona" })
+        .valid,
+    ).toBe(true);
+  });
+
+  test("run-stage conductor_persona non-string -> rejected", () => {
+    // .sh line 171-173: present-and-non-string is rejected, naming kind+field.
+    const r = validateDirective({ ...runStage(), conductor_persona: 42 });
+    expect(r.valid).toBe(false);
+    expect(errs({ ...runStage(), conductor_persona: 42 })).toContain(
+      "run-stage: conductor_persona must be string, got number",
+    );
+  });
+
+  // ============================================================
+  // mode enum miss on run-stage (1 assertion)
+  // .sh lines 179-180
+  // ============================================================
+
+  test("run-stage mode enum miss -> error", () => {
+    expect(errs({ ...runStage(), mode: "hologram" })).toContain(
+      "run-stage: mode must be one of",
+    );
+  });
+
+  // ============================================================
+  // Reviewer fields on a run-stage directive (V4a)
+  // ============================================================
+  // reviewer / reviewer_max_iterations are optional run-stage fields, present
+  // only when the stage declares a reviewer. The directive validator mirrors
+  // the stage-schema validator: reviewer optional-string,
+  // reviewer_max_iterations optional positive-integer. Absent is fine; a valid
+  // pair validates; a non-string reviewer or non-integer cap is rejected.
+
+  test("run-stage reviewer + cap present and valid -> VALID", () => {
+    expect(
+      errs({
+        ...runStage(),
+        reviewer: "aidlc-architecture-reviewer-agent",
+        review_artifact: "decisions",
+        reviewer_max_iterations: 3,
+      }),
+    ).toBe("VALID");
+  });
+
+  test("run-stage non-string reviewer -> type error", () => {
+    expect(errs({ ...runStage(), reviewer: 42 })).toContain(
+      "run-stage: reviewer must be string, got number",
+    );
+  });
+
+  test("run-stage non-integer reviewer_max_iterations -> positive-integer error", () => {
+    expect(
+      errs({
+        ...runStage(),
+        reviewer: "aidlc-architecture-reviewer-agent",
+        review_artifact: "decisions",
+        reviewer_max_iterations: "two",
+      }),
+    ).toContain(
+      "run-stage: reviewer_max_iterations must be a positive integer, got string",
+    );
+  });
+
+  // ============================================================
+  // consumes_absent is an optional run-stage/dispatch-subagent field, present
+  // only when a declared consume's file is missing at emit time. Each entry
+  // must be {path: string, expected: boolean}. Absent is fine; a valid array
+  // validates; a non-array, non-object element, or badly typed member is
+  // rejected with a field-precise error.
+
+  test("run-stage consumes_absent valid array -> VALID", () => {
+    expect(
+      errs({
+        ...runStage(),
+        consumes_absent: [
+          { path: "aidlc-docs/inception/units-generation/unit-of-work.md", expected: true },
+          { path: "aidlc-docs/inception/requirements/requirements.md", expected: false },
+        ],
+      }),
+    ).toBe("VALID");
+  });
+
+  test("dispatch-subagent consumes_absent valid -> VALID (shared field set)", () => {
+    expect(
+      errs({
+        ...dispatchSubagent(),
+        consumes_absent: [{ path: "a/b.md", expected: true }],
+      }),
+    ).toBe("VALID");
+  });
+
+  test("run-stage consumes_absent non-array -> type error", () => {
+    expect(errs({ ...runStage(), consumes_absent: "nope" })).toContain(
+      "run-stage: consumes_absent must be array, got string",
+    );
+  });
+
+  test("run-stage consumes_absent non-object element -> element error", () => {
+    expect(errs({ ...runStage(), consumes_absent: ["a/b.md"] })).toContain(
+      "run-stage: consumes_absent[0] must be object, got string",
+    );
+  });
+
+  test("run-stage consumes_absent bad member types -> per-field errors", () => {
+    const e = errs({
+      ...runStage(),
+      consumes_absent: [{ path: 42, expected: "yes" }],
+    });
+    expect(e).toContain("run-stage: consumes_absent[0].path must be string, got number");
+    expect(e).toContain("run-stage: consumes_absent[0].expected must be boolean, got string");
+  });
+
+  // ============================================================
+  // next_stage - optional-nullable run-stage/dispatch-subagent field. Present as
+  // a string names the following in-scope stage (rendered verbatim into the
+  // Approve gate option); null means this is the final in-scope stage; absent
+  // carries no name. So string OR null validates; any other present value is
+  // rejected. Fixes the gate always saying "Continue to Code Generation".
+  // ============================================================
+
+  test("run-stage next_stage string -> VALID", () => {
+    expect(errs({ ...runStage(), next_stage: "NFR Requirements" })).toBe(
+      "VALID",
+    );
+  });
+
+  test("run-stage next_stage null -> VALID (final in-scope stage)", () => {
+    expect(errs({ ...runStage(), next_stage: null })).toBe("VALID");
+  });
+
+  test("dispatch-subagent next_stage string -> VALID (shared field set)", () => {
+    expect(errs({ ...dispatchSubagent(), next_stage: "Build and Test" })).toBe(
+      "VALID",
+    );
+  });
+
+  test("run-stage next_stage non-string non-null -> type error", () => {
+    expect(errs({ ...runStage(), next_stage: 42 })).toContain(
+      "run-stage: next_stage must be string or null, got number",
+    );
+  });
+
+  test("stage_validity is a valid universal advisory field", () => {
+    const stageValidity = {
+      state: "drifted",
+      directly_stale: ["requirements-analysis"],
+      needs_revalidation: ["code-generation"],
+      untracked: [],
+      earliest_affected_stage: "requirements-analysis",
+      warning: "Routing is continuing in advisory mode.",
+    };
+    for (const directive of [
+      loadSteering(),
+      runStage(),
+      dispatchSubagent(),
+      invokeSwarm(),
+      presentGate(),
+      ask(),
+      print(),
+      error(),
+      done(),
+      parked(),
+    ]) {
+      expect(validateDirective({ ...directive, stage_validity: stageValidity }).valid)
+        .toBe(true);
+    }
+  });
+
+  test("stage_validity rejects malformed machine fields", () => {
+    const e = errs({
+      ...runStage(),
+      stage_validity: {
+        state: "blocking",
+        directly_stale: "requirements-analysis",
+        needs_revalidation: [],
+        untracked: [],
+        earliest_affected_stage: 42,
+        warning: false,
+        extra: true,
+      },
+    });
+    expect(e).toContain("stage_validity unknown key: extra");
+    expect(e).toContain("stage_validity.state must be drifted");
+    expect(e).toContain("stage_validity.directly_stale must be string array");
+    expect(e).toContain("stage_validity.earliest_affected_stage must be string or null");
+    expect(e).toContain("stage_validity.warning must be string");
+  });
+
+  // ============================================================
+  // Shape failures — non-object inputs (3 assertions)
+  // .sh lines 186-188
+  // ============================================================
+
+  test("null -> shape error", () => {
+    expect(errs(null)).toContain("expected object, got null");
+  });
+
+  test("array -> shape error", () => {
+    expect(errs([])).toContain("expected object, got array");
+  });
+
+  test("string -> shape error", () => {
+    expect(errs("x")).toContain("expected object, got string");
+  });
+});

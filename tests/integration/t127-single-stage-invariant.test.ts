@@ -1,0 +1,725 @@
+// covers: subcommand:aidlc-orchestrate:next, subcommand:aidlc-orchestrate:report, subcommand:aidlc-audit:append, subcommand:aidlc-audit:append-batch, function:emitSingleRunStage, function:handleSingleReport, function:clearActiveDirectiveMarker, function:refuseReservedCliEvent, function:refuseReservedCliBatch
+//
+// t127 — the `--single` stage-runner invariant (v0.6.0 Wave 3 milestone 14).
+// Migrated from tests/integration/t127-single-stage-invariant.sh (TAP plan 16).
+// Mechanism: cli. The whole subject is the engine's PROCESS boundary —
+// `next --stage <slug> --single` / `report --single --stage <slug>` argv,
+// the JSON directive on stdout, the bytes the synthetic lifecycle appends
+// to aidlc-docs/audit.md, AND the pointer-invariant read of the main state
+// file via aidlc-state.ts get. Every assertion is observable only across
+// that boundary, so each case SPAWNS the real tool via the BUN runtime
+// against the .ts path (the same pattern t104.cli credits), exactly as the
+// .sh shelled out to `bun "$TOOL" ...`.
+//
+// Source under test (dist/claude/.claude/tools/aidlc-orchestrate.ts):
+//   :910  next Branch 4b — `if (flags.single)` short-circuits BEFORE the
+//          jump/scope-change branches (so no mutating path is reached): rejects
+//          --single+--phase (:911), requires --stage (:919), else delegates to
+//   :1246 emitSingleRunStage(slug, scope, projectType): builds the lone
+//          run-stage directive from the GRAPH NODE alone (stateContent: null →
+//          never reads/writes the main pointer), attaches conductor_persona
+//          (D-E, :1281). Rejects an initialization stage (:1258 SINGLE_INIT_ERROR)
+//          and a SKIP-for-scope stage with the verbatim skip wording (:1264).
+//   :1741 handleSingleReport(flags, projectDir): requires --result (:1745),
+//          and the EXPLICIT half of the pointer rule — refuses a --single report
+//          with NO --stage as an attempt to advance the main workflow (:1762).
+//          `next --single` records STAGE_STARTED before dispatch; on success
+//          report records STAGE_COMPLETED under the same synthetic id
+//          `single-stage:<slug>`, then emits a `done` directive.
+//          report Branch -1 (:1833) routes here before any main-workflow branch.
+//   The companion never dispatches advance/approve/complete-workflow, so the
+//   main pointer is structurally untouchable from a single-stage run.
+//
+// The state-pointer read uses aidlc-state.ts `get "Current Stage"` (the .sh's
+// $STATE_TOOL), spawned the same way, asserting the field is `feasibility`
+// before AND after each --single leg.
+//
+// Old TAP -> new test parity (1:1, every .sh assertion -> a named test()):
+//   .sh 1  (main starts parked at feasibility)          -> test "1: main workflow starts parked at feasibility"
+//   .sh 2  (next --single emits run-stage)              -> test "2: next --single emits a run-stage directive"
+//   .sh 3  (targets requested stage, not Current Stage) -> test "3: next --single targets the requested stage"
+//   .sh 4  (conductor_persona on first directive, D-E)  -> test "4: next --single delivers the conductor persona"
+//   .sh 5  (next --single leaves Current Stage)         -> test "5: next --single leaves main Current Stage untouched"
+//   .sh 6  (report --single emits done)                 -> test "6: report --single emits a done directive"
+//   .sh 7  (report --single leaves Current Stage)       -> test "7: report --single leaves main Current Stage untouched"
+//   .sh 8  (exactly one STAGE_STARTED)                  -> test "8: next --single commits exactly one STAGE_STARTED"
+//   .sh 9  (exactly one STAGE_COMPLETED)                -> test "9: report --single commits exactly one STAGE_COMPLETED"
+//   .sh 10 (pair tagged with single-stage workflow id)  -> test "10: synthetic pair tagged with single-stage workflow id"
+//   .sh 11 (report --single no --stage errors)          -> test "11: report --single with no --stage errors"
+//   .sh 12 (refused report commits no STAGE_COMPLETED)  -> test "12: refused report --single commits no STAGE_COMPLETED"
+//   .sh 13 (next --single no --stage errors)            -> test "13: next --single with no --stage errors"
+//   .sh 14 (next --single rejects init stage)           -> test "14: next --single rejects an initialization stage"
+//   .sh 15 (next --single rejects SKIP-for-scope stage) -> test "15: next --single rejects a SKIP-for-scope stage"
+//   .sh 16 (next --single --phase mutually exclusive)   -> test "16: next --single --phase errors"
+//
+// §6-E note: tests 11/13/14/15/16 are the tool-enforced REFUSALS — each
+// asserts the `error` directive ACTUALLY fires (the verbatim refusal string),
+// and test 12 proves the refused report commits NOTHING (zero STAGE_COMPLETED
+// on disk). The happy-path pointer cases (5,7) additionally read the real
+// state file back, proving the pointer is unmoved — not merely absent of a
+// move directive.
+
+import { afterEach, describe, expect, test } from "bun:test";
+import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { join, relative } from "node:path";
+import {
+  AIDLC_SRC,
+  cleanupTestProject,
+  createOrchestrationTestProject,
+  runOrchestrateNext,
+  seedAuditFile,
+  seededAuditShard,
+  seededRecordDir,
+  seedStateFile,
+} from "../harness/fixtures.ts";
+import { appendAuditEntry } from "../../dist/claude/.claude/tools/aidlc-audit.ts";
+import {
+  SUMMARY_CONFIRMATION_HASH_SCOPE,
+  summaryConfirmationContentHash,
+} from "../../dist/claude/.claude/tools/aidlc-lib.ts";
+
+const BUN = process.execPath; // the bun running this test
+const TOOL = join(AIDLC_SRC, "tools", "aidlc-orchestrate.ts");
+const STATE_TOOL = join(AIDLC_SRC, "tools", "aidlc-state.ts");
+const AUDIT_TOOL = join(AIDLC_SRC, "tools", "aidlc-audit.ts");
+const LOG_TOOL = join(AIDLC_SRC, "tools", "aidlc-log.ts");
+const STATE_FIXTURE = "state-mid-ideation.md";
+
+function activeDirectiveMarkerPath(proj: string): string {
+  return join(seededRecordDir(proj), ".aidlc-active-directive.json");
+}
+
+const projects: string[] = [];
+
+afterEach(() => {
+  for (const p of projects.splice(0)) cleanupTestProject(p);
+});
+
+/** A fresh temp project registered for teardown (mirrors create_test_project). */
+function freshProject(): string {
+  const proj = createOrchestrationTestProject();
+  projects.push(proj);
+  return proj;
+}
+
+/** Combined stdout+stderr of a spawned orchestrate/state invocation (the .sh's 2>&1). */
+function run(tool: string, args: string[]): { out: string; status: number } {
+  if (tool === TOOL && args[0] === "next") {
+    const projectIndex = args.indexOf("--project-dir");
+    const project = args[projectIndex + 1];
+    const nextArgs = [
+      ...args.slice(1, projectIndex),
+      ...args.slice(projectIndex + 2),
+    ];
+    const result = runOrchestrateNext(tool, project, nextArgs);
+    return { out: result.out, status: result.status };
+  }
+  const res = spawnSync(BUN, [tool, ...args], { encoding: "utf-8" });
+  return {
+    out: `${res.stdout ?? ""}${res.stderr ?? ""}`,
+    status: res.status ?? -1,
+  };
+}
+
+function runSummaryGuarded(
+  tool: string,
+  args: string[],
+): { out: string; status: number } {
+  const env = { ...process.env };
+  delete env.AIDLC_SKIP_SUMMARY_CONFIRMATION_GUARD;
+  delete env.AIDLC_SKIP_HUMAN_PRESENCE_GUARD;
+  const res = spawnSync(BUN, [tool, ...args], { encoding: "utf-8", env });
+  return {
+    out: `${res.stdout ?? ""}${res.stderr ?? ""}`,
+    status: res.status ?? -1,
+  };
+}
+
+function startSingle(proj: string, stage: string): void {
+  const result = run(TOOL, [
+    "next",
+    "--stage",
+    stage,
+    "--single",
+    "--project-dir",
+    proj,
+  ]);
+  expect(result.status, result.out).toBe(0);
+  expect(result.out).toContain('"kind":"run-stage"');
+  expect(result.out).toContain(`"stage":"${stage}"`);
+}
+
+/** `aidlc-state.ts get "Current Stage"` — the main pointer the .sh read. */
+function currentStage(proj: string): string {
+  return run(STATE_TOOL, ["get", "Current Stage", "--project-dir", proj]).out.trim();
+}
+
+/**
+ * count_event (t127:38-40): audit rows of one event type. The .sh grepped
+ * `^**Event**: <TYPE>$`; here we count lines that equal `**Event**: <TYPE>`.
+ */
+function countEvent(proj: string, event: string): number {
+  // P9: the synthetic pair lands in the seeded record's per-clone shard
+  // (seedAuditFile pins the clone-id, so the report subprocess and the test
+  // resolve the SAME shard), not the flat aidlc-docs/audit.md.
+  const body = readFileSync(seededAuditShard(proj), "utf-8");
+  return body.split("\n").filter((l) => l === `**Event**: ${event}`).length;
+}
+
+// ===========================================================================
+// Tests 1-7: pointer invariant across next --single + report --single.
+// Seed an ACTIVE feature workflow parked at `feasibility` (Current Stage),
+// run a DIFFERENT stage (code-generation) via --single, and prove neither
+// leg moves the main pointer off `feasibility`. The .sh ran these against a
+// single shared project; here each test rebuilds the same seeded project so
+// the cases are order-independent (STRONGER isolation, same observables).
+// ===========================================================================
+describe("t127 --single pointer invariant (migrated from t127-single-stage-invariant.sh, plan 16)", () => {
+  test("1: main workflow starts parked at feasibility [.sh 1]", () => {
+    const proj = freshProject();
+    seedStateFile(proj, STATE_FIXTURE);
+    expect(currentStage(proj)).toBe("feasibility");
+  });
+
+  test("2: next --single emits a run-stage directive [.sh 2]", () => {
+    const proj = freshProject();
+    seedStateFile(proj, STATE_FIXTURE);
+    const r = run(TOOL, [
+      "next", "--stage", "code-generation", "--single", "--project-dir", proj,
+    ]);
+    expect(r.out).toContain('"kind":"run-stage"');
+  });
+
+  test("2b: next --single marks the isolated non-gated conductor branch", () => {
+    const proj = freshProject();
+    seedStateFile(proj, STATE_FIXTURE);
+    const r = run(TOOL, [
+      "next", "--stage", "code-generation", "--single", "--project-dir", proj,
+    ]);
+    const directive = JSON.parse(r.out.trim()) as Record<string, unknown>;
+    expect(directive.single).toBe(true);
+    expect(directive.gate).toBe(false);
+    expect(directive.next_stage).toBeNull();
+  });
+
+  test("3: next --single targets the requested stage, not Current Stage [.sh 3]", () => {
+    const proj = freshProject();
+    seedStateFile(proj, STATE_FIXTURE);
+    const r = run(TOOL, [
+      "next", "--stage", "code-generation", "--single", "--project-dir", proj,
+    ]);
+    expect(r.out).toContain('"stage":"code-generation"');
+  });
+
+  test("4: next --single delivers the conductor persona on the first directive (D-E) [.sh 4]", () => {
+    const proj = freshProject();
+    seedStateFile(proj, STATE_FIXTURE);
+    const r = run(TOOL, [
+      "next", "--stage", "code-generation", "--single", "--project-dir", proj,
+    ]);
+    expect(r.out).toContain('"conductor_persona"');
+  });
+
+  test("5: next --single leaves the main Current Stage untouched [.sh 5]", () => {
+    const proj = freshProject();
+    seedStateFile(proj, STATE_FIXTURE);
+    // before
+    expect(currentStage(proj)).toBe("feasibility");
+    run(TOOL, ["next", "--stage", "code-generation", "--single", "--project-dir", proj]);
+    // after — read the real state file back; the pointer must be unmoved.
+    expect(currentStage(proj)).toBe("feasibility");
+  });
+
+  test("6: report --single emits a done directive [.sh 6]", () => {
+    const proj = freshProject();
+    seedStateFile(proj, STATE_FIXTURE);
+    startSingle(proj, "code-generation");
+    const r = run(TOOL, [
+      "report", "--single", "--stage", "code-generation", "--result", "completed",
+      "--project-dir", proj,
+    ]);
+    expect(r.out).toContain('"kind":"done"');
+  });
+
+  test("7: report --single leaves the main Current Stage untouched [.sh 7]", () => {
+    const proj = freshProject();
+    seedStateFile(proj, STATE_FIXTURE);
+    startSingle(proj, "code-generation");
+    run(TOOL, [
+      "report", "--single", "--stage", "code-generation", "--result", "completed",
+      "--project-dir", proj,
+    ]);
+    expect(currentStage(proj)).toBe("feasibility");
+  });
+
+  // =========================================================================
+  // Tests 8-10: the synthetic-id audit pair lands, tagged, audit-only.
+  // Seed audit-sample.md (which carries ZERO STAGE_STARTED/STAGE_COMPLETED
+  // rows — verified), so the post-commit counts are exactly the pair the
+  // --single report wrote.
+  // =========================================================================
+  test("8: next --single commits exactly one STAGE_STARTED [.sh 8]", () => {
+    const proj = freshProject();
+    seedStateFile(proj, STATE_FIXTURE);
+    seedAuditFile(proj);
+    startSingle(proj, "code-generation");
+    run(TOOL, [
+      "report", "--single", "--stage", "code-generation", "--result", "completed",
+      "--project-dir", proj,
+    ]);
+    expect(countEvent(proj, "STAGE_STARTED")).toBe(1);
+  });
+
+  test("9: report --single commits exactly one STAGE_COMPLETED [.sh 9]", () => {
+    const proj = freshProject();
+    seedStateFile(proj, STATE_FIXTURE);
+    seedAuditFile(proj);
+    startSingle(proj, "code-generation");
+    run(TOOL, [
+      "report", "--single", "--stage", "code-generation", "--result", "completed",
+      "--project-dir", proj,
+    ]);
+    expect(countEvent(proj, "STAGE_COMPLETED")).toBe(1);
+  });
+
+  test("10: the synthetic pair is tagged with the single-stage workflow id [.sh 10]", () => {
+    const proj = freshProject();
+    seedStateFile(proj, STATE_FIXTURE);
+    seedAuditFile(proj);
+    startSingle(proj, "code-generation");
+    run(TOOL, [
+      "report", "--single", "--stage", "code-generation", "--result", "completed",
+      "--project-dir", proj,
+    ]);
+    const body = readFileSync(seededAuditShard(proj), "utf-8");
+    // syntheticWorkflowId("code-generation") === "single-stage:code-generation".
+    // STRONGER than the .sh's single grep: BOTH committed rows must carry the
+    // `**Workflow**: single-stage:code-generation` tag (the .sh proved one).
+    const tagged = body
+      .split("\n")
+      .filter((l) => l === "**Workflow**: single-stage:code-generation").length;
+    expect(tagged).toBe(2);
+  });
+
+  test("10b: append-batch validates the complete pair before writing either row", () => {
+    const proj = freshProject();
+    seedStateFile(proj, STATE_FIXTURE);
+    seedAuditFile(proj);
+    const before = readFileSync(seededAuditShard(proj), "utf-8");
+    const entries = JSON.stringify([
+      {
+        eventType: "STAGE_STARTED",
+        fields: {
+          Stage: "code-generation",
+          Workflow: "single-stage:code-generation",
+        },
+      },
+      {
+        eventType: "NOT_A_REAL_EVENT",
+        fields: {
+          Stage: "code-generation",
+          Workflow: "single-stage:code-generation",
+        },
+      },
+    ]);
+
+    const result = run(AUDIT_TOOL, [
+      "append-batch",
+      entries,
+      "--project-dir",
+      proj,
+    ]);
+
+    expect(result.status).not.toBe(0);
+    expect(result.out).toContain("Invalid event type: NOT_A_REAL_EVENT");
+    expect(readFileSync(seededAuditShard(proj), "utf-8")).toBe(before);
+  });
+
+  test("10c: public audit append cannot forge a summary-confirmation receipt", () => {
+    const proj = freshProject();
+    seedStateFile(proj, STATE_FIXTURE);
+    seedAuditFile(proj);
+    const before = readFileSync(seededAuditShard(proj), "utf-8");
+    const result = run(AUDIT_TOOL, [
+      "append",
+      "SUMMARY_CONFIRMATION_RECORDED",
+      "--field",
+      "Stage=requirements-analysis",
+      "--project-dir",
+      proj,
+    ]);
+    expect(result.status).not.toBe(0);
+    expect(result.out).toContain("reserved for its owning hook/tool");
+    expect(readFileSync(seededAuditShard(proj), "utf-8")).toBe(before);
+  });
+
+  // =========================================================================
+  // Tests 11-12: report --single with NO --stage is an attempt to advance the
+  // main workflow -> error (tool-enforced refusal), committing nothing.
+  // =========================================================================
+  test("11: report --single with no --stage errors (refuses to advance the main workflow) [.sh 11]", () => {
+    const proj = freshProject();
+    seedStateFile(proj, STATE_FIXTURE);
+    seedAuditFile(proj);
+    const r = run(TOOL, [
+      "report", "--single", "--result", "completed", "--project-dir", proj,
+    ]);
+    expect(r.out).toContain('"kind":"error"');
+    // STRONGER: pin the verbatim refusal wording (aidlc-orchestrate.ts:1763).
+    expect(r.out).toContain("must not advance the main workflow");
+  });
+
+  test("12: the refused report --single commits no STAGE_COMPLETED [.sh 12]", () => {
+    const proj = freshProject();
+    seedStateFile(proj, STATE_FIXTURE);
+    seedAuditFile(proj);
+    run(TOOL, ["report", "--single", "--result", "completed", "--project-dir", proj]);
+    expect(countEvent(proj, "STAGE_COMPLETED")).toBe(0);
+  });
+
+  test("12b: report --single rejects skipped because it is a main-workflow routing outcome", () => {
+    const proj = freshProject();
+    seedStateFile(proj, STATE_FIXTURE);
+    seedAuditFile(proj);
+    const r = run(TOOL, [
+      "report",
+      "--single",
+      "--stage",
+      "code-generation",
+      "--result",
+      "skipped",
+      "--reason",
+      "not applicable",
+      "--project-dir",
+      proj,
+    ]);
+    expect(r.out).toContain('"kind":"error"');
+    expect(r.out).toContain("commits forward outcomes only");
+    expect(currentStage(proj)).toBe("feasibility");
+    expect(countEvent(proj, "STAGE_STARTED")).toBe(0);
+    expect(countEvent(proj, "STAGE_COMPLETED")).toBe(0);
+    expect(countEvent(proj, "STAGE_SKIPPED")).toBe(0);
+  });
+
+  test("12c: report --single refuses a question-bearing stage without summary confirmation", () => {
+    const proj = freshProject();
+    seedStateFile(proj, STATE_FIXTURE);
+    seedAuditFile(proj);
+    startSingle(proj, "requirements-analysis");
+    const result = runSummaryGuarded(TOOL, [
+      "report",
+      "--single",
+      "--stage",
+      "requirements-analysis",
+      "--result",
+      "completed",
+      "--project-dir",
+      proj,
+    ]);
+    expect(result.out).toContain('"kind":"error"');
+    expect(result.out).toContain("has no requirements-analysis-questions.md");
+    expect(countEvent(proj, "STAGE_COMPLETED")).toBe(0);
+  });
+
+  test("12d: report --single accepts a human-backed receipt and post-confirmation artifact", () => {
+    const proj = freshProject();
+    seedStateFile(proj, STATE_FIXTURE);
+    seedAuditFile(proj);
+    const state = readFileSync(join(seededRecordDir(proj), "aidlc-state.md"), "utf-8");
+    writeFileSync(
+      activeDirectiveMarkerPath(proj),
+      `${JSON.stringify({
+        version: 1,
+        stage: "feasibility",
+        state_sha256: createHash("sha256").update(state, "utf-8").digest("hex"),
+      })}\n`,
+    );
+    expect(
+      run(TOOL, [
+        "next",
+        "--stage",
+        "requirements-analysis",
+        "--single",
+        "--project-dir",
+        proj,
+      ]).out,
+    ).toContain('"stage":"requirements-analysis"');
+    expect(
+      JSON.parse(
+        readFileSync(activeDirectiveMarkerPath(proj), "utf-8"),
+      ) as { stage?: string },
+    ).toMatchObject({ stage: "requirements-analysis" });
+    const stageDir = join(
+      seededRecordDir(proj),
+      "inception",
+      "requirements-analysis",
+    );
+    mkdirSync(stageDir, { recursive: true });
+    const questions = join(stageDir, "requirements-analysis-questions.md");
+    writeFileSync(
+      questions,
+      "# Questions\n\n## Consolidated Summary Confirmation\n\n- Looks correct\n- Request changes\n\n[Answer]: \n",
+    );
+
+    expect(
+      runSummaryGuarded(LOG_TOOL, [
+        "decision",
+        "--stage",
+        "requirements-analysis",
+        "--checkpoint",
+        "summary-confirmation",
+        "--questions-file",
+        questions,
+        "--single",
+        "--decision",
+        "Does this all look correct?",
+        "--project-dir",
+        proj,
+      ]).status,
+    ).toBe(0);
+    appendAuditEntry("HUMAN_TURN", {}, proj);
+    writeFileSync(
+      questions,
+      "# Questions\n\n## Consolidated Summary Confirmation\n\n- Looks correct\n- Request changes\n\n[Answer]: Looks correct\n",
+    );
+    expect(
+      runSummaryGuarded(LOG_TOOL, [
+        "answer",
+        "--stage",
+        "requirements-analysis",
+        "--checkpoint",
+        "summary-confirmation",
+        "--questions-file",
+        questions,
+        "--single",
+        "--details",
+        "Looks correct",
+        "--project-dir",
+        proj,
+      ]).status,
+    ).toBe(0);
+
+    const artifact = join(stageDir, "requirements.md");
+    writeFileSync(artifact, "# Requirements\n");
+    appendAuditEntry(
+      "ARTIFACT_CREATED",
+      { File: artifact, Tool: "Write" },
+      proj,
+    );
+
+    const result = runSummaryGuarded(TOOL, [
+      "report",
+      "--single",
+      "--stage",
+      "requirements-analysis",
+      "--result",
+      "completed",
+      "--project-dir",
+      proj,
+    ]);
+    expect(result.out).toContain('"kind":"done"');
+    expect(countEvent(proj, "STAGE_COMPLETED")).toBe(1);
+    expect(existsSync(activeDirectiveMarkerPath(proj))).toBe(false);
+  });
+
+  test("12e: an isolated per-unit stage binds its receipt to the selected questions file", () => {
+    const proj = freshProject();
+    seedStateFile(proj, STATE_FIXTURE);
+    seedAuditFile(proj);
+    startSingle(proj, "functional-design");
+    const stageDir = join(
+      seededRecordDir(proj),
+      "construction",
+      "api",
+      "functional-design",
+    );
+    mkdirSync(stageDir, { recursive: true });
+    const questions = join(stageDir, "functional-design-questions.md");
+    writeFileSync(
+      questions,
+      "# Questions\n\n## Consolidated Summary Confirmation\n\n- Looks correct\n- Request changes\n\n[Answer]: \n",
+    );
+    expect(
+      runSummaryGuarded(LOG_TOOL, [
+        "decision",
+        "--stage",
+        "functional-design",
+        "--checkpoint",
+        "summary-confirmation",
+        "--questions-file",
+        questions,
+        "--single",
+        "--decision",
+        "Does this all look correct?",
+        "--project-dir",
+        proj,
+      ]).status,
+    ).toBe(0);
+    appendAuditEntry("HUMAN_TURN", {}, proj);
+    writeFileSync(
+      questions,
+      "# Questions\n\n## Consolidated Summary Confirmation\n\n- Looks correct\n- Request changes\n\n[Answer]: Looks correct\n",
+    );
+    expect(
+      runSummaryGuarded(LOG_TOOL, [
+        "answer",
+        "--stage",
+        "functional-design",
+        "--checkpoint",
+        "summary-confirmation",
+        "--questions-file",
+        questions,
+        "--single",
+        "--details",
+        "Looks correct",
+        "--project-dir",
+        proj,
+      ]).status,
+    ).toBe(0);
+    for (const name of [
+      "entities",
+      "rules",
+      "functional-spec",
+    ]) {
+      const artifact = join(stageDir, `${name}.md`);
+      writeFileSync(artifact, `# ${name}\n`);
+      appendAuditEntry(
+        "ARTIFACT_CREATED",
+        { File: artifact, Tool: "Write" },
+        proj,
+      );
+    }
+
+    const result = runSummaryGuarded(TOOL, [
+      "report",
+      "--single",
+      "--stage",
+      "functional-design",
+      "--result",
+      "completed",
+      "--project-dir",
+      proj,
+    ]);
+    expect(result.out).toContain('"kind":"done"');
+  });
+
+  test("12f: isolated hash recovery stays on the --single workflow", () => {
+    const proj = freshProject();
+    seedStateFile(proj, STATE_FIXTURE);
+    seedAuditFile(proj);
+    startSingle(proj, "requirements-analysis");
+    const stageDir = join(
+      seededRecordDir(proj),
+      "inception",
+      "requirements-analysis",
+    );
+    mkdirSync(stageDir, { recursive: true });
+    const questions = join(stageDir, "requirements-analysis-questions.md");
+    const confirmed =
+      "# Questions\n\n## Consolidated Summary Confirmation\n\n" +
+      "- Keep the confirmed requirement.\n\n[Answer]: Looks correct\n";
+    writeFileSync(questions, confirmed);
+    appendAuditEntry(
+      "SUMMARY_CONFIRMATION_RECORDED",
+      {
+        Stage: "requirements-analysis",
+        Details: "Looks correct",
+        Checkpoint: "Consolidated Summary Confirmation",
+        Workflow: "single-stage:requirements-analysis",
+        "Questions File": relative(proj, questions).replaceAll("\\", "/"),
+        "Questions SHA-256": summaryConfirmationContentHash(confirmed),
+        "Hash Scope": SUMMARY_CONFIRMATION_HASH_SCOPE,
+      },
+      proj,
+    );
+    writeFileSync(
+      questions,
+      confirmed.replace("confirmed requirement", "modified requirement"),
+    );
+    const artifact = join(stageDir, "requirements.md");
+    writeFileSync(artifact, "# Requirements\n");
+    appendAuditEntry(
+      "ARTIFACT_CREATED",
+      { File: artifact, Tool: "Write" },
+      proj,
+    );
+
+    const result = runSummaryGuarded(TOOL, [
+      "report",
+      "--single",
+      "--stage",
+      "requirements-analysis",
+      "--result",
+      "completed",
+      "--project-dir",
+      proj,
+    ]);
+    expect(result.out).toContain('"kind":"error"');
+    expect(result.out).toContain("aidlc-log.ts decision");
+    expect(result.out).toContain("aidlc-log.ts answer");
+    expect(result.out).toContain("--single");
+    expect(result.out).toContain("report --single");
+    expect(result.out).toContain("--result completed");
+    expect(result.out).not.toContain("--result rejected");
+    expect(result.out).not.toContain("--result revised");
+  });
+
+  // =========================================================================
+  // Test 13: next --single requires --stage.
+  // =========================================================================
+  test("13: next --single with no --stage errors [.sh 13]", () => {
+    const proj = freshProject();
+    seedStateFile(proj, STATE_FIXTURE);
+    const r = run(TOOL, ["next", "--single", "--project-dir", proj]);
+    expect(r.out).toContain('"kind":"error"');
+    // STRONGER: pin the verbatim wording (aidlc-orchestrate.ts:921).
+    expect(r.out).toContain("--single requires --stage");
+  });
+
+  // =========================================================================
+  // Test 14: an initialization stage cannot run via --single.
+  // =========================================================================
+  test("14: next --single rejects an initialization stage (use --init) [.sh 14]", () => {
+    const proj = freshProject();
+    seedStateFile(proj, STATE_FIXTURE);
+    const r = run(TOOL, [
+      "next", "--stage", "workspace-detection", "--single", "--project-dir", proj,
+    ]);
+    expect(r.out).toContain("initialization stage with --single");
+  });
+
+  // =========================================================================
+  // Test 15: a SKIP-for-scope stage cannot run via --single.
+  // `user-stories` is SKIP for bugfix; --single relays the verbatim skip
+  // wording. Use a NO-STATE project so the explicit --scope bugfix resolves
+  // (an active workflow's state Scope would win the precedence ladder).
+  // =========================================================================
+  test("15: next --single rejects a SKIP-for-scope stage with the verbatim skip wording [.sh 15]", () => {
+    const proj = freshProject();
+    // No-state project: createTestProject already leaves aidlc-docs/ empty, so
+    // there is no aidlc-state.md (the .sh did `rm -f` defensively — here it
+    // never existed). The flag --scope bugfix therefore resolves.
+    const r = run(TOOL, [
+      "next", "--stage", "user-stories", "--single", "--scope", "bugfix",
+      "--project-dir", proj,
+    ]);
+    // The verbatim wording is `Stage "..." is skipped for scope "bugfix".`; in
+    // JSON stdout the quotes are backslash-escaped, so match the quote-free
+    // substring (same as the .sh).
+    expect(r.out).toContain("is skipped for scope");
+  });
+
+  // =========================================================================
+  // Test 16: --single + --phase is mutually exclusive.
+  // =========================================================================
+  test("16: next --single --phase errors (one stage, not a range) [.sh 16]", () => {
+    const proj = freshProject();
+    seedStateFile(proj, STATE_FIXTURE);
+    const r = run(TOOL, [
+      "next", "--single", "--phase", "inception", "--project-dir", proj,
+    ]);
+    expect(r.out).toContain("Cannot use --single with --phase");
+  });
+});
