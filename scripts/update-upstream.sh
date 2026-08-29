@@ -59,12 +59,23 @@ echo "==> dynamo-pg adapter tests"
 
 echo "==> refresh UPSTREAM_VERSIONS.md"
 today="$(date +%F)"
-aidlc_sha="$(git log --grep="git-subtree-dir: upstream/aidlc-workflows" --format=%b -1 | sed -n 's/git-subtree-split: //p')"
-collab_sha="$(git log --grep="git-subtree-dir: upstream/collab" --format=%b -1 | sed -n 's/git-subtree-split: //p')"
-sed -i \
-  -e "s|\(upstream/aidlc-workflows.*\` \)\`[0-9a-f]*\`\( | \).*\( |\)|\1\`${aidlc_sha}\`\2${today}\3|" \
-  -e "s|\(upstream/collab.*\` \)\`[0-9a-f]*\`\( | \).*\( |\)|\1\`${collab_sha}\`\2${today}\3|" \
-  UPSTREAM_VERSIONS.md
+aidlc_sha="$(git log --grep="git-subtree-dir: upstream/aidlc-workflows" --format=%b -1 | sed -n 's/.*git-subtree-split: //p' | head -1)"
+collab_sha="$(git log --grep="git-subtree-dir: upstream/collab$" --format=%b -1 | sed -n 's/.*git-subtree-split: //p' | head -1)"
+AIDLC_SHA="$aidlc_sha" COLLAB_SHA="$collab_sha" TODAY="$today" \
+AIDLC_REF="$aidlc_ref" COLLAB_REF="$collab_ref" node -e '
+  const fs = require("fs");
+  const rewrite = (line, ref, refKind, sha) =>
+    line.replace(/\| `[^`]*` \([^)]*\) \| `[0-9a-f]*` \| [0-9-]* \|$/,
+      `| \`${ref}\` (${refKind}) | \`${sha}\` | ${process.env.TODAY} |`);
+  const out = fs.readFileSync("UPSTREAM_VERSIONS.md", "utf8").split("\n").map((line) => {
+    if (line.includes("`upstream/aidlc-workflows`"))
+      return rewrite(line, process.env.AIDLC_REF, "branch", process.env.AIDLC_SHA);
+    if (line.includes("`upstream/collab`"))
+      return rewrite(line, process.env.COLLAB_REF, "tag", process.env.COLLAB_SHA);
+    return line;
+  }).join("\n");
+  fs.writeFileSync("UPSTREAM_VERSIONS.md", out);
+'
 
 git add -A
 git status --short | head -20
