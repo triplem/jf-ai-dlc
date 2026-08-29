@@ -210,6 +210,17 @@ Everything that differs from upstream, in one place:
 - **Issuer split**: tokens carry the public issuer (`OIDC_ISSUER`) while JWKS
   are fetched in-network (`OIDC_JWKS_URL`); Keycloak is pinned via
   `KC_HOSTNAME` so `iss` is stable.
+- **Config env vars the deploy must set** (found via the click-test):
+  `AWS_ENDPOINT_URL_COGNITO_IDENTITY_PROVIDER` (the SDK's service key uses the
+  full `COGNITO_IDENTITY_PROVIDER` id, not `COGNITO_IDP`, or the admin lambda
+  hits real AWS); `COGNITO_USER_POOL_ID` (any placeholder — the handler guards
+  on it, aws-shim ignores the value and lists Keycloak users); and
+  `V2_PROCESS_TABLE` (the v2-executions table the intent list reads — its
+  digit-prefixed name slipped the table-env auto-enumeration). All three are
+  wired in compose and the Helm ConfigMap.
+- **Keycloak realm pins stable user UUIDs** for `alice`/`admin` so realm
+  re-imports don't reassign `sub` and orphan graph-owned data; the `jf-ui`
+  client sets `webOrigins: ["*"]` for the browser's cross-origin token call.
 - **Pricing** returns an empty price list (no OSS pricing source).
 - **dynamo-pg is single-writer** (like DynamoDB Local): run exactly one
   replica. `TransactWriteItems` is implemented as serialized conditional ops
@@ -236,13 +247,25 @@ Everything that differs from upstream, in one place:
   200 with history fallback; full browser-equivalent flow verified — Keycloak
   password grant (with CORS) → `id_token` (carries `groups` for platform-admin)
   → `Bearer` API call returns 200.
+- **Browser click-test** (headless Chromium against the live stack): 8/8 deep
+  flows green with zero console errors and zero API errors — login, dashboard,
+  open space, new-intent page, block library, workflows, create-space wizard,
+  and Platform Admin (which lists the Keycloak realm users via aws-shim:
+  "2 users · 1 admin"). Realtime transport verified separately: ws-gateway
+  closes an unauthenticated socket `4401`, and a valid-JWT socket reaches the
+  upstream `$connect` handler (`4403` until a per-intent doc token is supplied).
 - Helm: `helm lint` clean, `helm template` renders 16 resources.
 
 ## Known gaps
 
-- **Frontend deep flows** beyond auth (realtime editing, intent orchestration
-  UI) are wired but not yet click-tested end-to-end against the live stack;
-  auth, routing, and API calls are verified.
+- **Live collaborative editing session** (two browsers editing one intent
+  document) needs a seeded intent + document + per-intent doc token, which the
+  orchestrator mints during a real agent run — so it needs the git-provider
+  OAuth and `--profile agents` path. The realtime transport, auth, and handler
+  dispatch are verified; a full co-editing session is not yet exercised.
+- **Creating a space through the UI** requires connecting a git provider
+  (GitHub/GitLab/Bitbucket OAuth) — an external dependency. The click-test
+  seeds a space via the same REST API the UI calls, then drives the deep views.
 - **Frontend profile edits** are stored browser-local (the SPA has no Keycloak
   account-write grant); they don't propagate to Keycloak user attributes.
 - **session-runner k8s backend**: prod currently uses the shared-runtime

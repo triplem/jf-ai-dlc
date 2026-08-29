@@ -14,7 +14,7 @@ data:
   AWS_ENDPOINT_URL_SECRETS_MANAGER: http://{{ .Release.Name }}-aws-shim:3004
   AWS_ENDPOINT_URL_LAMBDA: http://{{ .Release.Name }}-aws-shim:3004
   AWS_ENDPOINT_URL_PRICING: http://{{ .Release.Name }}-aws-shim:3004
-  AWS_ENDPOINT_URL_COGNITO_IDP: http://{{ .Release.Name }}-aws-shim:3004
+  AWS_ENDPOINT_URL_COGNITO_IDENTITY_PROVIDER: http://{{ .Release.Name }}-aws-shim:3004
   AWS_ENDPOINT_URL_BEDROCK_AGENTCORE: http://{{ .Release.Name }}-session-runner:3003
   NEPTUNE_ENDPOINT: {{ .Values.endpoints.gremlinHost | quote }}
   GREMLIN_PORT: {{ .Values.endpoints.gremlinPort | quote }}
