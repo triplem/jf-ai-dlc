@@ -37,7 +37,9 @@ const verifyToken = async (token) => {
   if (!jwks) {
     const issuer = process.env.OIDC_ISSUER;
     if (!issuer) throw new Error('OIDC_ISSUER is not configured');
-    jwks = createRemoteJWKSet(new URL(`${issuer.replace(/\/$/, '')}/protocol/openid-connect/certs`));
+    const jwksUrl =
+      process.env.OIDC_JWKS_URL || `${issuer.replace(/\/$/, '')}/protocol/openid-connect/certs`;
+    jwks = createRemoteJWKSet(new URL(jwksUrl));
   }
   const { payload } = await jwtVerify(token, jwks, { issuer: process.env.OIDC_ISSUER });
   return payload;
