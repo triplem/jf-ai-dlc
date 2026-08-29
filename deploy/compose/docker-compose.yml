@@ -231,7 +231,9 @@ services:
   agentcore:
     profiles: ["agents"]
     build:
-      context: ../../upstream/collab/lambda/agentcore
+      context: ../..
+      dockerfile: overlay/agentcore/Dockerfile
+    image: jf-ai-dlc-agentcore
     environment:
       <<: *app-env
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
