@@ -77,6 +77,25 @@ scripts/             generators + installers + update workflow
 
 ## Usage
 
+**Build the plugins from core (core → Claude / Codex plugin)**
+
+```bash
+scripts/build-plugin.sh                 # both harnesses
+scripts/build-plugin.sh claude          # just the Claude Code plugin
+scripts/build-plugin.sh codex           # just the Codex plugin
+scripts/build-plugin.sh both --check    # verify dist matches core, then transform
+scripts/build-plugin.sh --from-dist     # skip the core rebuild; transform committed dist only
+```
+
+Two steps run automatically per harness: (1) upstream's own packager
+(`bun scripts/package.ts <harness>`) regenerates `dist/<harness>` from the
+hand-authored `core/` + `harness/` sources, then (2) `vendor-plugins.mjs`
+applies the OSS transforms into `plugins/<harness>`. Step 1 needs `bun`
+(`curl -fsSL https://bun.sh/install | bash`); the first run does a one-time
+`bun install` in the subtree. Use `--from-dist` to run only step 2 when `bun`
+is unavailable. The transition is reproducible — rebuilding from an unchanged
+`core/` yields byte-identical plugins.
+
 **Install the AI-DLC plugin into a project**
 
 ```bash
@@ -139,7 +158,7 @@ cd upstream/collab && npm ci && npx vitest run -c ../../overlay/oracle/vitest.co
 
 Everything that differs from upstream, in one place:
 
-### Plugin transforms (`scripts/vendor-plugins.mjs`, applied on every update)
+### Plugin transforms (`scripts/vendor-plugins.mjs`, via `build-plugin.sh`, applied on every update)
 - **AWS MCP servers removed** from `plugins/claude/.mcp.json` (`aws-mcp`,
   `aws-pricing`, `aws-iac`, `aws-serverless`); `context7` kept.
 - **Codex provider switched** from Amazon Bedrock to native OpenAI auth:
