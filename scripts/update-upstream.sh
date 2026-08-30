@@ -57,6 +57,9 @@ node scripts/vendor-plugins.mjs
 echo "==> dynamo-pg adapter tests"
 (cd overlay/dynamo-pg && npm test)
 
+echo "==> durable-execution protocol tests"
+(cd overlay/durable && npm test)
+
 echo "==> refresh UPSTREAM_VERSIONS.md"
 today="$(date +%F)"
 aidlc_sha="$(git log --grep="git-subtree-dir: upstream/aidlc-workflows" --format=%b -1 | sed -n 's/.*git-subtree-split: //p' | head -1)"
