@@ -20,6 +20,7 @@ For build/install usage and the list of transforms, see the root
 | [Requirements & dependencies](requirements.md) | The (small) host tooling needed to build and install the plugin |
 | [Connecting to the collab platform (MCP)](collab-mcp.md) | The optional `collaborative-aidlc` MCP entry: per-harness config, the `--with-collab` toggle, and pointing it at your deployment |
 | [Updating the upstream](upstream-updates.md) | How to fetch a newer AI-DLC version through the git-subtree pipeline |
+| [Modifying upstream — the transform workflow](local-adjustments.md) | Why `upstream/` stays pristine, how the OSS transforms (`vendor-plugins.mjs`) produce `plugins/`, and how to add or change one |
 
 ## Quick links
 
