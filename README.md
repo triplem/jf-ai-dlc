@@ -119,3 +119,4 @@ Deeper, topical docs live in [`docs/`](docs/):
 - [Why this project exists](docs/why.md) — the problem it solves and full credit to the upstream projects.
 - [Requirements & dependencies](docs/requirements.md) — the (small) host tooling needed to build and install the plugin.
 - [Updating the upstream](docs/upstream-updates.md) — how to fetch a newer AI-DLC version.
+- [Modifying upstream — the transform workflow](docs/local-adjustments.md) — how the OSS transforms keep `upstream/` pristine, and how to add or change one.
