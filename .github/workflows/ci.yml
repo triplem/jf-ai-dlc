@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  vendor:
+    # The plugins must be reproducible from the vendored upstream dist/.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: node scripts/vendor-plugins.mjs
+      - name: plugins/ are in sync with upstream dist/ (transforms reproducible)
+        run: git diff --exit-code plugins/
+      - name: install-plugin smoke (both harnesses + collab toggle)
+        run: |
+          scripts/install-plugin.sh "$RUNNER_TEMP/inst" both --with-collab
+          test -f "$RUNNER_TEMP/inst/.mcp.json"
+          test -d "$RUNNER_TEMP/inst/.claude"
+          test -d "$RUNNER_TEMP/inst/.codex"
+          grep -q collaborative-aidlc "$RUNNER_TEMP/inst/.mcp.json"
+
+  build-from-core:
+    # The full core → dist → plugin transition must reproduce byte-for-byte.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: scripts/build-plugin.sh both --check
+      - name: rebuild yields byte-identical plugins
+        run: git diff --exit-code plugins/
