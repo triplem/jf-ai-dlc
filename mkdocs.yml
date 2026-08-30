@@ -23,6 +23,7 @@ nav:
   - Home: README.md
   - Why this project exists: why.md
   - Requirements & dependencies: requirements.md
+  - Connecting to the collab platform (MCP): collab-mcp.md
   - Updating the upstream: upstream-updates.md
 
 markdown_extensions:

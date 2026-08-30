@@ -18,6 +18,7 @@ For build/install usage and the list of transforms, see the root
 |---|---|
 | [Why this project exists](why.md) | The problem it solves, and prominent credit to the upstream project it builds on |
 | [Requirements & dependencies](requirements.md) | The (small) host tooling needed to build and install the plugin |
+| [Connecting to the collab platform (MCP)](collab-mcp.md) | The optional `collaborative-aidlc` MCP entry: per-harness config, the `--with-collab` toggle, and pointing it at your deployment |
 | [Updating the upstream](upstream-updates.md) | How to fetch a newer AI-DLC version through the git-subtree pipeline |
 
 ## Quick links
