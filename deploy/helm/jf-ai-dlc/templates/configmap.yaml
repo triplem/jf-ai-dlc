@@ -22,6 +22,12 @@ data:
   WEBSOCKET_ENDPOINT: http://{{ .Release.Name }}-ws-gateway:3002
   ARTIFACTS_BUCKET: {{ .Values.artifactsBucket | quote }}
   AGENTCORE_RUNTIME_ARN: arn:aws:bedrock-agentcore:local:000000000000:runtime/{{ .Release.Name }}
+  # Durable orchestrator: intent-start invokes this function, which aws-shim
+  # runs as a durable execution (overlay/durable).
+  V2_ORCHESTRATOR_FUNCTION: v2-orchestrator
+  SOURCE_CONTROL_FUNCTION: source-control
+  # cognito-users guards on this; aws-shim ignores the value and lists Keycloak.
+  COGNITO_USER_POOL_ID: {{ .Values.auth.realm | quote }}
   OIDC_ISSUER: {{ .Values.endpoints.oidcIssuer | quote }}
   OIDC_JWKS_URL: {{ .Values.endpoints.keycloakInternal }}/realms/{{ .Values.auth.realm }}/protocol/openid-connect/certs
   KC_URL: {{ .Values.endpoints.keycloakInternal | quote }}

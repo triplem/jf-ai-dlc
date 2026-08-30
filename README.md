@@ -288,6 +288,15 @@ Everything that differs from upstream, in one place:
   admin"). Realtime transport verified separately: ws-gateway closes an
   unauthenticated socket `4401`, and a valid-JWT socket reaches the upstream
   `$connect` handler (`4403` until a per-intent doc token is supplied).
+- **Durable orchestrator end-to-end** (the `overlay/durable` emulator against
+  the real `v2-orchestrator`, `--profile agents`): starting a greenfield intent
+  drives the full durable loop — `load-meta → mint-run-id → init-ws → load-plan
+  → stage dispatch` — with correct checkpoint, replay, retry re-run, callback
+  minting/suspend, and callback resume all verified. `init-ws` succeeds via
+  agentcore, which then spawns **Claude Code with the AI-DLC MCP server
+  `connected`** (the MCP→graph write path). The Claude driver runs in
+  direct-Anthropic mode (not Bedrock). The only step not yet exercised is the
+  model call itself, which needs an `ANTHROPIC_API_KEY` (403 without one).
 - Helm: `helm lint` clean, `helm template` renders 16 resources.
 
 ## Known gaps
@@ -305,6 +314,9 @@ Everything that differs from upstream, in one place:
 - **session-runner k8s backend**: prod currently uses the shared-runtime
   (`http`) backend against an agentcore Deployment; a Jobs-per-session backend
   is planned.
-- **v2-orchestrator / durable executions** run through the same adapters but
-  have not been exercised end-to-end with a live agent stage yet (requires
-  provider API keys and `--profile agents`).
+- **A live agent stage producing an artifact** is one step from done: the
+  durable orchestrator drives the stack all the way to Claude Code with the MCP
+  server connected, but the model call needs an `ANTHROPIC_API_KEY` in
+  `deploy/compose/.env`. With the key, the stage authenticates, writes an
+  artifact via the MCP tools, and the callback resumes the run to the next
+  stage. See [docs/running-an-agent-stage.md](docs/running-an-agent-stage.md).

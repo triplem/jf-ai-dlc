@@ -18,6 +18,7 @@ go deeper on specific topics.
 | [Requirements & dependencies](requirements.md) | Host tooling and runtime services needed to build and run, with versions, purposes, homepages, and licenses |
 | [Updating the upstreams](upstream-updates.md) | How to fetch a newer version of AI-DLC and Collaborative AI-DLC through the git-subtree + overlay pipeline |
 | [Docker images & Compose](docker.md) | Every image (custom and third-party) and a service-by-service tour of the Compose stack |
+| [Running an agent stage](running-an-agent-stage.md) | End-to-end: a greenfield intent → durable orchestrator → agentcore → Claude Code runs a stage → artifact in the graph |
 
 ## Quick links
 
