@@ -19,6 +19,7 @@ jobs:
         run: git diff --exit-code plugins/
       - name: install-plugin smoke (both harnesses + collab toggle)
         run: |
+          mkdir -p "$RUNNER_TEMP/inst"
           scripts/install-plugin.sh "$RUNNER_TEMP/inst" both --with-collab
           test -f "$RUNNER_TEMP/inst/.mcp.json"
           test -d "$RUNNER_TEMP/inst/.claude"
